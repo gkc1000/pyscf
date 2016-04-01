@@ -31,8 +31,9 @@ def cc_tau1(cc,t1,t2,eris,feri2=None):
     tmp_oovv  = np.empty(tmp_oovv_shape,dtype=t1.dtype)
     tmp2_oovv = np.zeros_like(tmp_oovv)
 
-    tau1 = feri2['tau1']
     tau1_ooVv = feri2['tau1_ooVv']
+    tau1_oOvv = feri2['tau1_oOvv']
+    tau1_oovv_rev = feri2['tau1_oovv_rev']
     tau2_Oovv = feri2['tau2_Oovv']
 
     good2go = True
@@ -49,85 +50,86 @@ def cc_tau1(cc,t1,t2,eris,feri2=None):
                     tmp2_oovv[iterki,iterkj,iterka] *= 0.0
                     if ki == ka and kj == kb:
                         tmp2_oovv[iterki,iterkj,iterka] = einsum('ia,jb->ijab',t1[ki],t1[kj])
-        tau1[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
-                tmp_oovv[:len(ranges0),:len(ranges1),:len(ranges2)]
-                #tmp_oovv[:len(ranges0),:len(ranges1),:len(ranges2)].reshape(len(r0),len(r1),len(r2)*nocc,nocc,nvir,nvir)
+
+                    tau1_oovv_rev[kj,ka,kb] = (tmp_oovv[iterki,iterkj,iterka] + tmp2_oovv[iterki,iterkj,iterka])
+
         tau1_ooVv[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,nvir*min(ranges2):nvir*(max(ranges2)+1)] = \
                 ( tmp_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] +
                         tmp2_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] ).transpose(0,1,2,5,3,4,6).reshape(len(ranges0),len(ranges1),len(ranges2)*nvir,nocc,nocc,nvir)
+        tau1_oOvv[min(ranges0):max(ranges0)+1,min(ranges2):max(ranges2)+1,nocc*min(ranges1):nocc*(max(ranges1)+1)] = \
+                ( tmp_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] +
+                        tmp2_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] ).transpose(0,2,1,4,3,5,6).reshape(len(ranges0),len(ranges2),len(ranges1)*nocc,nocc,nvir,nvir)
         tau2_Oovv[min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1,nocc*min(ranges0):nocc*(max(ranges0)+1)] = \
                 ( tmp_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] +
-                        2*tmp2_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] ).transpose(1,2,0,4,3,5,6).reshape(len(ranges1),len(ranges2),len(ranges0)*nocc,nocc,nvir,nvir)
+                        2*tmp2_oovv[:len(ranges0),:len(ranges1),:len(ranges2)] ).transpose(1,2,0,3,4,5,6).reshape(len(ranges1),len(ranges2),len(ranges0)*nocc,nocc,nvir,nvir)
         loader.slave_finished()
-        #feri2.tau1[ki,kj,ka] = tmp_oovv
-        #feri2.tau1_ooVv[ki,kj,ka*nvir:(ka+1)*nvir] = (tmp_oovv+tmp2).transpose(2,0,1,3)
-        #feri2.tau2_Oovv[kj,ka,ki*nocc:(ki+1)*nocc] = (tmp_oovv+2*tmp2).transpose(1,0,2,3)
     cc.comm.Barrier()
     return
 
-def cc_Foo(cc,t1,t2,eris):
+@profile
+def cc_Foo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
     Fki = np.empty((nkpts,nocc,nocc),dtype=t2.dtype)
+
+    tau1_oOvv = feri2['tau1_oOvv']
     for ki in range(nkpts):
         kk = ki
         Fki[ki] = eris.fock[ki,:nocc,:nocc].copy()
-        for kl in range(nkpts):
-            for kc in range(nkpts):
-                kd = kconserv[kk,kc,kl]
-                Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-                Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
-            #if ki == kc:
-            kd = kconserv[kk,ki,kl]
-            Soovv = 2*eris.oovv[kk,kl,ki] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-            Fki[ki] += einsum('klcd,ic,ld->ki',Soovv,t1[ki],t1[kl])
+        for kc in range(nkpts):
+            Fki[ki] += einsum('lkcd,licd->ki',eris.SoOvv[kk,kc],tau1_oOvv[ki,kc])
+            #for kl in range(nkpts):
+            #    kd = kconserv[kk,kc,kl]
+            #    Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
+            #    Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
+            ##if ki == kc:
+            #kd = kconserv[kk,ki,kl]
+            #Soovv = 2*eris.oovv[kk,kl,ki] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
+            #Fki[ki] += einsum('klcd,ic,ld->ki',Soovv,t1[ki],t1[kl])
     return Fki
 
-def cc_Fvv(cc,t1,t2,eris):
+@profile
+def cc_Fvv(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
     Fac = np.empty((nkpts,nvir,nvir),dtype=t2.dtype)
+
+    tau1_oOvv = feri2['tau1_oOvv']
     for ka in range(nkpts):
         kc = ka
         Fac[ka] = eris.fock[ka,nocc:,nocc:].copy()
-        for kl in range(nkpts):
-            for kk in range(nkpts):
-                kd = kconserv[kk,kc,kl]
-                Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-                Fac[ka] += -einsum('klcd,klad->ac',Soovv,t2[kk,kl,ka])
-            #if kk == ka
-            kd = kconserv[ka,kc,kl]
-            Soovv = 2*eris.oovv[ka,kl,kc] - eris.oovv[ka,kl,kd].transpose(0,1,3,2)
-            Fac[ka] += -einsum('klcd,ka,ld->ac',Soovv,t1[ka],t1[kl])
+        for kk in range(nkpts):
+            Fac[ka] += -einsum('lkcd,lkad->ac',eris.SoOvv[kk,kc],tau1_oOvv[kk,ka])
+
     return Fac
 
-def cc_Fov(cc,t1,t2,eris):
+@profile
+def cc_Fov(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     Fkc = np.empty((nkpts,nocc,nvir),dtype=t2.dtype)
     Fkc[:] = eris.fock[:,:nocc,nocc:].copy()
     for kk in range(nkpts):
-        for kl in range(nkpts):
-            Soovv = 2.*eris.oovv[kk,kl,kk] - eris.oovv[kk,kl,kl].transpose(0,1,3,2)
-            Fkc[kk] += einsum('klcd,ld->kc',Soovv,t1[kl])
+        Fkc[kk] += einsum('lkcd,ld->kc',eris.SoOvv[kk,kk],t1.reshape(nkpts*nocc,nvir))
     return Fkc
 
 ### Eqs. (40)-(41) "lambda"
 
-def Loo(cc,t1,t2,eris):
+@profile
+def Loo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     fov = eris.fock[:,:nocc,nocc:]
-    Lki = cc_Foo(cc,t1,t2,eris)
+    Lki = cc_Foo(cc,t1,t2,eris,feri2)
     for ki in range(nkpts):
         Lki[ki] += einsum('kc,ic->ki',fov[ki],t1[ki])
-        for kl in range(nkpts):
-            Sooov = 2*eris.ooov[ki,kl,ki] - eris.ooov[kl,ki,ki].transpose(1,0,2,3)
-            Lki[ki] += einsum('klic,lc->ki',Sooov,t1[kl])
+        SoOov = (2*eris.ooov[ki,:,ki] - eris.ooov[:,ki,ki].transpose(0,2,1,3,4)).transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nocc,nvir)
+        Lki[ki] += einsum('lkic,lc->ki',SoOov,t1.reshape(nkpts*nocc,nvir))
     return Lki
 
-def Lvv(cc,t1,t2,eris):
+@profile
+def Lvv(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     fov = eris.fock[:,:nocc,nocc:]
-    Lac = cc_Fvv(cc,t1,t2,eris)
+    Lac = cc_Fvv(cc,t1,t2,eris,feri2)
     for ka in range(nkpts):
         Lac[ka] += -einsum('kc,ka->ac',fov[ka],t1[ka])
         for kk in range(nkpts):
@@ -154,7 +156,8 @@ def cc_Woooo(cc,t1,t2,eris,feri2=None):
     oooo_tmp = np.empty(shape=oooo_tmp_shape,dtype=t1.dtype)
 
     tau1_ooVv = feri2['tau1_ooVv']
-    Woooo     = feri2['Woooo']
+    #Woooo     = feri2['Woooo']
+    Woooo_rev = feri2['Woooo_rev']
 
     good2go = True
     while(good2go):
@@ -182,9 +185,10 @@ def cc_Woooo(cc,t1,t2,eris,feri2=None):
                     #oooo_tmp[iterkk,iterkl,iterki] += einsum('klcd,ic,jd->klij',eris.oovv[kk,kl,ki],t1[ki],t1[kj])
                     #Woooo[kk,kl,ki] = oooo_tmp[iterkk,iterkl,iterki]
                     #Woooo[kl,kk,kj] = oooo_tmp[iterkk,iterkl,iterki].transpose(1,0,3,2)
+                    Woooo_rev[kl,ki,kj] = oooo_tmp[iterkk,iterkl,iterki]
 
-        Woooo[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
-                        oooo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        #Woooo[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
+        #                oooo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
 
         #
         # for if you want to take into account symmetry of Woooo integral
@@ -195,7 +199,7 @@ def cc_Woooo(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-#@profile
+@profile
 def cc_Wvvvv(cc,t1,t2,eris,feri2=None):
     ## Slow:
     nkpts, nocc, nvir = t1.shape
@@ -235,7 +239,7 @@ def cc_Wvvvv(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-#@profile
+@profile
 def cc_Wvoov(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -249,7 +253,8 @@ def cc_Wvoov(cc,t1,t2,eris,feri2=None):
     voov_tmp = np.empty(voov_tmp_shape,dtype=t1.dtype)
 
     tau2_Oovv = feri2['tau2_Oovv']
-    Wvoov     = feri2['Wvoov']
+    #Wvoov     = feri2['Wvoov']
+    WvOov     = feri2['WvOov']
 
     good2go = True
     while(good2go):
@@ -282,19 +287,17 @@ def cc_Wvoov(cc,t1,t2,eris,feri2=None):
                     #
                     # Making various intermediates...
                     #
-                    oovvf = np.empty((nkpts,nocc,nocc,nvir,nvir),dtype=t1.dtype)
-                    oovvf[:] = eris.oovv_new[kk,kc,:].transpose(0,2,1,4,3)
-                    kd = kconserv[ka,kc,kk]
-                    oovvf  = oovvf.reshape(nkpts*nocc,nocc,nvir,nvir)
-
-                    t2_oOvv = t2[ki,:,ka].transpose(0,1,2,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
+                    t2_oOvv = t2[ki,:,ka].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
+                    #eris_oOvv = eris.oovv[kk,:,kc].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
 
                     voov_tmp[iterka,iterkk,iterki] += 0.5*einsum('lkcd,liad->akic',eris.SoOvv[kk,kc],t2_oOvv)
                     voov_tmp[iterka,iterkk,iterki] -= 0.5*einsum('lkcd,liad->akic',eris.oOvv[kk,kc],tau2_Oovv[ki,ka])
 
                     # =====   End of change  =====
-        Wvoov[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
-                voov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        #Wvoov[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
+        #        voov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        WvOov[min(ranges0):max(ranges0)+1,min(ranges2):max(ranges2)+1,nocc*min(ranges1):nocc*(max(ranges1)+1)] = \
+                voov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)].transpose(0,2,1,4,3,5,6).reshape(len(ranges1),len(ranges2),len(ranges0)*nocc,nvir,nocc,nvir)
         loader.slave_finished()
     cc.comm.Barrier()
     return
@@ -312,6 +315,7 @@ def cc_Wvovo(cc,t1,t2,eris,feri2=None):
     vovo_tmp = np.empty(shape=vovo_tmp_shape,dtype=t1.dtype)
 
     Wvovo = feri2['Wvovo']
+    WvOVo = feri2['WvOVo']
 
     good2go = True
     while(good2go):
@@ -347,6 +351,64 @@ def cc_Wvovo(cc,t1,t2,eris,feri2=None):
 
         Wvovo[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
                 vovo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        WvOVo[min(ranges0):max(ranges0)+1,nocc*min(ranges1):nocc*(max(ranges1)+1),nvir*min(ranges2):nvir*(max(ranges2)+1)] = \
+                vovo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)].transpose(0,1,4,2,5,3,6).reshape(len(ranges0),len(ranges1)*nocc,len(ranges2)*nvir,nvir,nocc)
+                    # =====   End of change  = ====
+        loader.slave_finished()
+    cc.comm.Barrier()
+    return
+
+@profile
+def cc_Wovov(cc,t1,t2,eris,feri2=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    BLKSIZE = (1,1,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+
+    ovov_tmp_shape = BLKSIZE + (nocc,nvir,nocc,nvir)
+    ovov_tmp = np.empty(shape=ovov_tmp_shape,dtype=t1.dtype)
+
+    #Wovov = feri2['Wovov']
+    WOvov = feri2['WOvov']
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+        for iterkk, kk in enumerate(ranges0):
+            for iterka, ka in enumerate(ranges1):
+                for iterki, ki in enumerate(ranges2):
+                    kc = kconserv[kk,ki,ka]
+                    ovov_tmp[iterkk,iterka,iterki] = np.array(eris.ovov[kk,ka,ki],copy=True)
+                    ovov_tmp[iterkk,iterka,iterki] -= einsum('lkci,la->kaic',eris.ooov[kk,ka,ki].transpose(1,0,3,2),t1[ka])
+                    ovov_tmp[iterkk,iterka,iterki] += einsum('akcd,id->kaic',eris.ovvv[kk,ka,ki].transpose(1,0,3,2),t1[ki])
+                    # ==== Beginning of change ====
+                    #
+                    #for kl in range(nkpts):
+                    #    kd = kconserv[kl,kc,kk]
+                    #    ovov_tmp[iterka,iterkk,iterkc] -= 0.5*einsum('lkcd,ilda->akci',eris.oovv[kl,kk,kc],t2[ki,kl,kd])
+                    #ovov_tmp[iterka,iterkk,iterkc] -= einsum('lkcd,id,la->akci',eris.oovv[ka,kk,kc],t1[ki],t1[ka])
+                    #Wvovo[ka,kk,kc] = ovov_tmp[iterka,iterkk,iterkc]
+
+                    oovvf = eris.oovv[:,kk,kc].reshape(nkpts*nocc,nocc,nvir,nvir)
+                    t2f   = t2[:,ki,ka].copy() #This is a tau like term
+                    #for kl in range(nkpts):
+                    #    kd = kconserv[kl,kc,kk]
+                    #    if ki == kd and kl == ka:
+                    #        t2f[kl] += 2*einsum('id,la->liad',t1[ki],t1[ka])
+                    kd = kconserv[ka,kc,kk]
+                    t2f[ka] += 2*einsum('id,la->liad',t1[kd],t1[ka])
+                    t2f = t2f.reshape(nkpts*nocc,nocc,nvir,nvir)
+                    ovov_tmp[iterkk,iterka,iterki] -= 0.5*einsum('lkcd,liad->kaic',oovvf,t2f)
+
+        #Wovov[min(ranges0):max(ranges0)+1,min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1] = \
+        #        ovov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        WOvov[min(ranges1):max(ranges1)+1,min(ranges2):max(ranges2)+1,nocc*min(ranges0):nocc*(max(ranges0)+1)] = \
+                ovov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)].transpose(1,2,0,3,4,5,6).reshape(len(ranges1),len(ranges2),len(ranges0)*nocc,nvir,nocc,nvir)
                     # =====   End of change  = ====
         loader.slave_finished()
     cc.comm.Barrier()

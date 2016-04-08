@@ -21,7 +21,6 @@ from pyscf.pbc.lib.linalg_helper import eigs
 #einsum = numpy.einsum
 einsum = pbclib.einsum
 
-
 # This is restricted (R)CCSD
 # following Hirata, ..., Barlett, J. Chem. Phys. 120, 2581 (2004)
 
@@ -109,67 +108,12 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     _tmpfile2_name = cc.comm.bcast(_tmpfile2_name, root=0)
     feri2 = h5py.File(_tmpfile2_name, 'w', driver='mpio', comm=MPI.COMM_WORLD)
 
-    tau1_ooVv = feri2.create_dataset('tau1_ooVv', (nkpts,nkpts,nkpts*nvir,nocc,nocc,nvir), dtype=ds_type)
-    tau1_oOvv = feri2.create_dataset('tau1_oOvv', (nkpts,nkpts,nkpts*nocc,nocc,nvir,nvir), dtype=ds_type)
-    tau1_oovv_rev = feri2.create_dataset('tau1_oovv_rev', (nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=ds_type)
-    tau2_Oovv = feri2.create_dataset('tau2_Oovv', (nkpts,nkpts,nkpts*nocc,nocc,nvir,nvir), dtype=ds_type)
-    #Woooo = feri2.create_dataset('Woooo', (nkpts,nkpts,nkpts,nocc,nocc,nocc,nocc), dtype=ds_type)
-    Woooo_rev = feri2.create_dataset('Woooo_rev', (nkpts,nkpts,nkpts,nocc,nocc,nocc,nocc), dtype=ds_type)
-    Wvvvv = feri2.create_dataset('Wvvvv', (nkpts,nkpts,nkpts,nvir,nvir,nvir,nvir), dtype=ds_type)
-    #Wvoov = feri2.create_dataset('Wvoov', (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
-    WvOov = feri2.create_dataset('WvOov', (nkpts,nkpts,nkpts*nocc,nvir,nocc,nvir), dtype=ds_type)
-    #Wvovo = feri2.create_dataset('Wvovo', (nkpts,nkpts,nkpts,nvir,nocc,nvir,nocc), dtype=ds_type)
-    #Wovov = feri2.create_dataset('Wovov', (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
-    WOvov = feri2.create_dataset('WOvov', (nkpts,nkpts,nkpts*nocc,nvir,nocc,nvir), dtype=ds_type)
-    WvOVo = feri2.create_dataset('WvOVo', (nkpts,nkpts*nocc,nkpts*nvir,nvir,nocc), dtype=ds_type)
-
-    print "making taus..."
-    imdk.cc_tau1(cc,t1,t2,eris,feri2)
-    feri2.close()
-    feri2 = h5py.File(_tmpfile2_name, 'r+', driver='mpio', comm=MPI.COMM_WORLD)
-
     Foo = imdk.cc_Foo(cc,t1,t2,eris,feri2)
     Fvv = imdk.cc_Fvv(cc,t1,t2,eris,feri2)
     Fov = imdk.cc_Fov(cc,t1,t2,eris,feri2)
     Loo = imdk.Loo(cc,t1,t2,eris,feri2)
     Lvv = imdk.Lvv(cc,t1,t2,eris,feri2)
 
-    print "making Woooo..."
-    imdk.cc_Woooo(cc,t1,t2,eris,feri2)
-    feri2.close()
-    feri2 = h5py.File(_tmpfile2_name, 'r+', driver='mpio', comm=MPI.COMM_WORLD)
-
-    print "making Wvvvv..."
-    imdk.cc_Wvvvv(cc,t1,t2,eris,feri2)
-    feri2.close()
-    feri2 = h5py.File(_tmpfile2_name, 'r+', driver='mpio', comm=MPI.COMM_WORLD)
-
-    print "making Wvoov..."
-    imdk.cc_Wvoov(cc,t1,t2,eris,feri2)
-    feri2.close()
-    feri2 = h5py.File(_tmpfile2_name, 'r+', driver='mpio', comm=MPI.COMM_WORLD)
-
-    print "making Wvovo..."
-    #imdk.cc_Wvovo(cc,t1,t2,eris,feri2)
-    imdk.cc_Wovov(cc,t1,t2,eris,feri2)
-    feri2.close()
-    feri2 = h5py.File(_tmpfile2_name, 'r+', driver='mpio', comm=MPI.COMM_WORLD)
-
-    #Woooo = feri2['Woooo']
-    Woooo_rev = feri2['Woooo_rev']
-    Wvvvv = feri2['Wvvvv']
-    #Wvoov = feri2['Wvoov']
-    WvOov = feri2['WvOov']
-    WvOVo = feri2['WvOVo']
-    #Wvovo = feri2['Wvovo']
-    Wovov = feri2['Wovov']
-    WOvov = feri2['WOvov']
-    tau1_ooVv = feri2['tau1_ooVv']
-    tau1_oovv_rev = feri2['tau1_oovv_rev']
-
-    if cc.rank == 0:
-        print Fvv[0,0,0]
-        print Lvv[0,0,0]
 
     print "done making intermediates..."
     # Move energy terms to the other side
@@ -209,12 +153,12 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
                 kd = kconserv[ka,kc,kk]
 
                 Svovv = 2*eris.ovvv[kk,ka,kd].transpose(1,0,3,2) - eris.ovvv[kk,ka,kc].transpose(1,0,2,3)
+                #Svovv = 2*eris.vovv[ka,kk,kc] - eris.vovv[ka,kk,kd].transpose(0,1,3,2)
                 tau_term_1 = t2[ki,kk,kc].copy()
                 if ki == kc and kk == kd:
                     tau_term_1 += einsum('ic,kd->ikcd',t1[ki],t1[kk])
                 t1new[ka] += einsum('akcd,ikcd->ia',Svovv,tau_term_1)
 
-            for kc in range(nkpts):
                 # kk - ki + kl = kc
                 #  => kl = ki - kk + kc
                 kl = kconserv[ki,kk,kc]
@@ -229,30 +173,113 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     # For conj(), see Hirata and Bartlett, Eq. (36)
     #t2new = numpy.array(eris.oovv, copy=True).conj()
     t2new = numpy.zeros((nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir),dtype=ds_type)
+    cput1 = time.clock(), time.time()
 
-    loader = mpi_load_balancer.load_balancer(BLKSIZE=(1,1,nkpts,))
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=(nkpts,nkpts,nkpts,))
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 
-    cput1 = time.clock(), time.time()
+    cput2 = time.clock(), time.time()
     good2go = True
     while(good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
         ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
-        for ki in ranges0:
-            for kj in ranges1:
-                for ka in ranges2:
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_oovv = eris.oovv[s0,s1,s2]
+        s0,s1    = [slice(min(x),max(x)+1) for x in ranges0,ranges1]
+        eris_oooo = eris.oooo[s0,s1]
+        s0,s1    = [slice(min(x),max(x)+1) for x in ranges0,ranges1]
+        eris_ovoo_ij = eris.ovoo[s0,s1]
+        s0,s1    = [slice(min(x),max(x)+1) for x in ranges0,ranges1]
+        eris_ovoo_ji = eris.ovoo[s1,s0]
+
+        for iterki,ki in enumerate(ranges0):
+            for iterkj,kj in enumerate(ranges1):
+                for iterka,ka in enumerate(ranges2):
                     # Chemist's notation for momentum conserving t2(ki,kj,ka,kb)
                     kb = kconserv[ki,ka,kj]
-                    t2new[ki,kj,ka] = numpy.array(eris.oovv[ki,kj,ka], copy=True).conj()
+                    #t2new[ki,kj,ka] = numpy.array(eris.oovv[ki,kj,ka],copy=True).conj()                   #oovv[ki,kj,ka,kb]
+                    t2new[ki,kj,ka] = _cp(eris_oovv[iterki,iterkj,iterka]).conj()                   #oovv[ki,kj,ka,kb]
 
-                    tau1_oOvv_rev = tau1_oovv_rev[:,ka,kb].transpose(0,2,1,3,4).reshape(nocc*nkpts,nocc,nvir,nvir)
-                    t2new[ki,kj,ka] += einsum('lkij,lkab->ijab',Woooo_rev[:,ki,kj].transpose(0,2,1,3,4).reshape(nocc*nkpts,nocc,nocc,nocc),tau1_oOvv_rev)
+                    #####################################################
+                    # This tau term is only used when dotted with Woooo #
+                    #####################################################
+                    tau1_OOvv = numpy.zeros((nkpts,nocc,nocc,nvir,nvir),dtype=t2.dtype)
+                    for kl in range(nkpts):
+                        kk = kconserv[kj,kl,ki]
+                        tau1_OOvv[kl] += t2[kk,kl,ka]
+                    tau1_OOvv[kb] += einsum('ka,lb->klab',t1[ka],t1[kb])
+                    tau1_OOvv = tau1_OOvv.reshape(-1,nvir,nvir)
 
-                    # technically this is a WvvVv term
-                    t2new[ki,kj,ka] += einsum('cabd,cijd->ijab',Wvvvv[ka,kb,:].transpose(0,3,1,2,4).reshape(nvir*nkpts,nvir,nvir,nvir),tau1_ooVv[ki,kj])
+                    ###################################
+                    # Woooo term ...
+                    ###################################
+                    wOOoo = numpy.empty((nkpts,nocc,nocc,nocc,nocc),dtype=t2.dtype)
+                    for kl in range(nkpts):
+                        kk = kconserv[kj,kl,ki]
+                        #wOOoo[kl] += numpy.array(eris.oooo[kk,kl,ki])                                      # oooo [*,*,ki,kj]
+                        wOOoo[kl] = _cp(eris_oooo[iterkj,iterki,kl].transpose(3,2,1,0)).conj()
+                        #wOOoo[kl] += einsum('klic,jc->klij',eris.ooov[kk,kl,ki],t1[kj])                    # ooov [*,*,ki,kj]  ovoo might be better? can call [ki,kj..]
+                        wOOoo[kl] += einsum('klic,jc->klij',eris_ovoo_ij[iterki,iterkj,kk].transpose(2,3,0,1).conj(),t1[kj])
+                        #wOOoo[kl] += einsum('klcj,ic->klij',eris.ooov[kl,kk,kj].transpose(1,0,3,2),t1[ki]) # ooov [*,*,kj,ki]
+                        wOOoo[kl] += einsum('lkjc,ic->klij',eris_ovoo_ji[iterkj,iterki,kl].transpose(2,3,0,1).conj(),t1[ki])
+                    wOOoo = wOOoo.reshape(-1,nocc,nocc)
+                    # TODO missing oovv term from Woooo, might be better to have vvoo and loop over kc,kd
+                    t2new[ki,kj,ka] += einsum('kij,kab->ijab',wOOoo,tau1_OOvv) #kl combined into one
 
+    #        loader.slave_finished()
+    #cput2 = log.timer_debug1('transforming Woooo', *cput2)
+
+    #loader = mpi_load_balancer.load_balancer(BLKSIZE=(1,1,nkpts,))
+    #loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+
+    #cput2 = time.clock(), time.time()
+    #good2go = True
+    #while(good2go):
+    #    good2go, data = loader.slave_set()
+    #    if good2go is False:
+    #        break
+    #    ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+    #    for ki in ranges0:
+    #        for kj in ranges1:
+    #            for ka in ranges2:
+    #                kb = kconserv[ki,ka,kj]
+
+                    #####################################################
+                    # This tau term is only used when dotted with Wvvvv #
+                    #####################################################
+                    tau1_ooVV = t2[ki,kj,:].copy()
+                    tau1_ooVV[ki] += einsum('ic,jd->ijcd',t1[ki],t1[kj])
+                    tau1_ooVV = tau1_ooVV.transpose(1,2,0,3,4).reshape(nocc,nocc,-1)
+
+                    ###################################
+                    # Wvvvv term ...
+                    ###################################
+                    wvvVV = numpy.zeros((nvir,nvir,nvir*nvir*nkpts),dtype=t2.dtype)
+
+                    # Wvvvv : making required eri's
+                    ovVV  = numpy.zeros((nkpts,nocc,nvir,nvir,nvir),dtype=t2.dtype)  # ovvv[ka,kb,*,*]
+                    for kc in range(nkpts):
+                        ovVV[kc] += eris.ovvv[ka,kb,kc]
+                    ovVV = ovVV.transpose(1,2,0,3,4).reshape(nocc,nvir,-1)
+
+                    voVV  = numpy.zeros((nkpts,nvir,nocc,nvir,nvir),dtype=t2.dtype)  # vovv[ka,kb,*,*]
+                    for kc in range(nkpts):
+                        kd = kconserv[ka,kc,kb]
+                        #voVV[kc] += eris.vovv[ka,kb,kc]
+                        voVV[kc] += eris.ovvv[kb,ka,kd].transpose(1,0,3,2)
+                    voVV = voVV.transpose(1,2,0,3,4).reshape(nvir,nocc,-1)
+
+                    wvvVV += einsum('akd,kb->abd',voVV,-t1[kb])
+                    wvvVV += einsum('kbd,ka->abd',ovVV,-t1[ka])
+                    # TODO missing vvvv term from Wvvvv
+                    t2new[ki,kj,ka] += einsum('abd,ijd->ijab',wvvVV,tau1_ooVV)
+
+                    ###################################
+                    # t2 with 1-electron terms ...
+                    ###################################
                     t2new[ki,kj,ka] += einsum('ac,ijcb->ijab',Lvv[ka],t2[ki,kj,ka])
                     #P(ij)P(ab)
                     t2new[ki,kj,ka] += einsum('bc,jica->ijab',Lvv[kb],t2[kj,ki,kb])
@@ -261,53 +288,176 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
                     #P(ij)P(ab)
                     t2new[ki,kj,ka] += einsum('kj,kiba->ijab',-Loo[kj],t2[kj,ki,kb])
 
-                    tmp2 = eris.ovvv[ki,kj,ka].transpose(2,3,0,1).conj() - einsum('kbic,ka->abic',eris.ovov[ka,kb,ki],t1[ka])
+                    ###################################
+                    # t1 with ovvv terms ...
+                    ###################################
+                    tmp2 = eris.ovvv[ki,kj,ka].transpose(2,3,0,1).conj() - \
+                            einsum('kbic,ka->abic',eris.ovov[ka,kb,ki],t1[ka]) #ovvv[ki,kj,ka,kb]  ovov[ka,kb,ki,kj]
                     tmp  = einsum('abic,jc->ijab',tmp2,t1[kj])
                     t2new[ki,kj,ka] += tmp
                     #P(ij)P(ab)
-                    tmp2 = eris.ovvv[kj,ki,kb].transpose(2,3,0,1).conj() - einsum('kajc,kb->bajc',eris.ovov[kb,ka,kj],t1[kb])
+                    tmp2 = eris.ovvv[kj,ki,kb].transpose(2,3,0,1).conj() - \
+                            einsum('kajc,kb->bajc',eris.ovov[kb,ka,kj],t1[kb]) #ovvv[kj,ki,kb,ka]  ovov[kb,ka,kj,ki]
                     tmp  = einsum('bajc,ic->ijab',tmp2,t1[ki])
                     t2new[ki,kj,ka] += tmp
 
-                    # ka - ki + kk = kj
-                    # => kk = ki - ka + kj
-                    kk = kconserv[ki,ka,kj]
-                    tmp2 = eris.ooov[kj,ki,kb].transpose(3,2,1,0).conj() + einsum('akic,jc->akij',eris.ovvo[kk,ka,kj].transpose(1,0,3,2),t1[kj])
+                    ###################################
+                    # t1 with ooov terms ...
+                    ###################################
+                    tmp2 = eris.ooov[kj,ki,kb].transpose(3,2,1,0).conj() + \
+                            einsum('akic,jc->akij',eris.ovvo[kb,ka,kj].transpose(1,0,3,2),t1[kj]) #ooov[kj,ki,kb,ka] ovvo[kb,ka,kj,ki]
                     tmp  = einsum('akij,kb->ijab',tmp2,t1[kb])
                     t2new[ki,kj,ka] -= tmp
                     #P(ij)P(ab)
-                    kk = kconserv[kj,kb,ki]
-                    tmp2 = eris.ooov[ki,kj,ka].transpose(3,2,1,0).conj() + einsum('bkjc,ic->bkji',eris.ovvo[kk,kb,ki].transpose(1,0,3,2),t1[ki])
+                    tmp2 = eris.ooov[ki,kj,ka].transpose(3,2,1,0).conj() + \
+                            einsum('bkjc,ic->bkji',eris.ovvo[ka,kb,ki].transpose(1,0,3,2),t1[ki]) #ooov[ki,kj,ka,kb] ovvo[ka,kb,ki,kj]
                     tmp  = einsum('bkji,ka->ijab',tmp2,t1[ka])
                     t2new[ki,kj,ka] -= tmp
 
-                    t2_oOvv = t2[kj,:,kb].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kaic,kjbc->ijab',2*WvOov[ka,ki]-WOvov[ka,ki],t2_oOvv)
-                    t2new[ki,kj,ka] += tmp
-                    #P(ij)P(ab)
-                    t2_oOvv = t2[ki,:,ka].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kbjc,kiac->ijab',2*WvOov[kb,kj]-WOvov[kb,kj],t2_oOvv)
-                    t2new[ki,kj,ka] += tmp
+                    #########################################################################################
+                    # Wvoov term (ka,kk,ki,kc)
+                    #    a) the Soovv contribution to Wvoov is done after the Wovov term, where
+                    #        Soovv = 2*oovv[l,k,c,d] - oovv[l,k,d,c]
+                    #########################################################################################
+                    _WvOoV  = _cp(eris.voov[ka,:,ki]).transpose(1,3,0,2,4).reshape(nvir,nocc,-1)                                           #voov[ka,*,ki,*]
+                    _WvOoV -= einsum('lic,la->aic',eris.ooov[ka,:,ki].transpose(1,3,0,2,4).reshape(nocc,nocc,-1),t1[ka])                   #ooov[ka,*,ki,*]
+                    _WvOoV += einsum('adc,id->aic',eris.vovv[ka,:,ki].transpose(1,3,0,2,4).reshape(nvir,nvir,-1),t1[ki])                   #vovv[ka,*,ki,*]
 
-                    t2_Oovv = t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kbic,kjac->ijab',WOvov[kb,ki],t2_Oovv)
-                    t2new[ki,kj,ka] -= tmp
-                    #P(ij)P(ab)
-                    t2_Oovv = t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kajc,kibc->ijab',WOvov[ka,kj],t2_Oovv)
-                    t2new[ki,kj,ka] -= tmp
+                    # kk free, kc fixed by kk,ka,ki
+                    # kl free, kd fixed by kk,kl,kc
+                    oOvV = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,ki,ka]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,ka,ki]
+                            oOvV[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = \
+                                    eris.oovv[kl,kk,kd].transpose(0,2,1,3).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,ki,ka].copy()
+                    tau2_OovV[ka] += 2*einsum('id,la->liad',t1[ki],t1[ka])
+                    _WvOoV -= 0.5*einsum('dc,iad->aic',oOvV,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1)) # kc consolidated into c, ld consolidated into d
 
-                    t2_Oovv = t2[:,kj,kb].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kaic,kjbc->ijab',WvOov[ka,ki],t2_Oovv)
-                    t2new[ki,kj,ka] -= tmp
-                    #P(ij)P(ab)
-                    t2_Oovv = t2[:,ki,ka].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    tmp = einsum('kbjc,kiac->ijab',WvOov[kb,kj],t2_Oovv)
-                    t2new[ki,kj,ka] -= tmp
+                    ###################################
+                    # Wovov term (kk,ka,ki,kc)
+                    ###################################
+                    _WOvoV = _cp(eris.ovov[:,ka,ki]).transpose(2,3,0,1,4).reshape(nvir,nocc,-1)                          #ovov[*,ka,ki,*]
+                    _WOvoV -= einsum('lic,la->aic',eris.ooov[:,ka,ki].transpose(2,3,0,1,4).reshape(nocc,nocc,-1),t1[ka]) #ooov[*,ka,ki,*]
+                    _WOvoV += einsum('adc,id->aic',eris.ovvv[:,ka,ki].transpose(2,3,0,1,4).reshape(nvir,nvir,-1),t1[ki]) #ovvv[*,ka,ki,*]
+
+                    # kk free, kc fixed by kk,ka,ki
+                    # kl free, kd fixed by kk,kl,kc
+                    oOVv = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,ki,ka]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,ka,ki]
+                            oOVv[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = eris.oovv[kl,kk,kc].transpose(0,3,1,2).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,ki,ka].copy()
+                    tau2_OovV[ka] += 2*einsum('id,la->liad',t1[ki],t1[ka])
+                    _WOvoV -= 0.5*einsum('dc,iad->aic',oOVv,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    _WvOoV += 0.5*einsum('dc,iad->aic',2*oOvV-oOVv,t2[ki,:,ka].transpose(1,3,0,2,4).reshape(nocc,nvir,-1))
+
+                    t2new[ki,kj,ka] += einsum('aic,jbc->ijab',(2*_WvOoV-_WOvoV),t2[kj,:,kb].transpose(1,3,0,2,4).reshape(nocc,nvir,-1))
+                    t2new[ki,kj,ka] -= einsum('aic,jbc->ijab',_WvOoV,t2[:,kj,kb].transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    ###################################
+                    # Wvoov term (kb,kk,kj,kc)
+                    ###################################
+                    _WvOoV  = _cp(eris.voov[kb,:,kj]).transpose(1,3,0,2,4).reshape(nvir,nocc,-1)                                           #voov[kb,*,kj,*]
+                    _WvOoV -= einsum('ljc,lb->bjc',eris.ooov[kb,:,kj].transpose(1,3,0,2,4).reshape(nocc,nocc,-1),t1[kb])                   #ooov[kb,*,kj,*]
+                    _WvOoV += einsum('bdc,jd->bjc',eris.vovv[kb,:,kj].transpose(1,3,0,2,4).reshape(nvir,nvir,-1),t1[kj])                   #vovv[kb,*,kj,*]
+
+                    # kk free, kc fixed by kk,kb,kj
+                    # kl free, kd fixed by kk,kl,kc
+                    oOvV = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,kj,kb]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,kb,kj]
+                            oOvV[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = \
+                                    eris.oovv[kl,kk,kd].transpose(0,2,1,3).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,kj,kb].copy()
+                    tau2_OovV[kb] += 2*einsum('jd,lb->ljbd',t1[kj],t1[kb])
+                    _WvOoV -= 0.5*einsum('dc,jbd->bjc',oOvV,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1)) # kc consolidated into c, ld consolidated into d
+
+                    ###################################
+                    # Wovov term (kk,kb,kj,kc)
+                    ###################################
+                    _WOvoV = _cp(eris.ovov[:,kb,kj]).transpose(2,3,0,1,4).reshape(nvir,nocc,-1)                          #ovov[*,kb,kj,*]
+                    _WOvoV -= einsum('ljc,lb->bjc',eris.ooov[:,kb,kj].transpose(2,3,0,1,4).reshape(nocc,nocc,-1),t1[kb]) #ooov[*,kb,kj,*]
+                    _WOvoV += einsum('bdc,jd->bjc',eris.ovvv[:,kb,kj].transpose(2,3,0,1,4).reshape(nvir,nvir,-1),t1[kj]) #ovvv[*,kb,kj,*]
+
+                    # kk free, kc fixed by kk,kb,kj
+                    # kl free, kd fixed by kk,kl,kc
+                    oOVv = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,kj,kb]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,kb,kj]
+                            oOVv[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = eris.oovv[kl,kk,kc].transpose(0,3,1,2).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,kj,kb].copy()
+                    tau2_OovV[kb] += 2*einsum('jd,lb->ljbd',t1[kj],t1[kb])
+                    _WOvoV -= 0.5*einsum('dc,jbd->bjc',oOVv,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    _WvOoV += 0.5*einsum('dc,jbd->bjc',2*oOvV-oOVv,t2[kj,:,kb].transpose(1,3,0,2,4).reshape(nocc,nvir,-1))
+
+                    t2new[ki,kj,ka] += einsum('bjc,iac->ijab',(2*_WvOoV-_WOvoV),t2[ki,:,ka].transpose(1,3,0,2,4).reshape(nocc,nvir,-1))
+                    t2new[ki,kj,ka] -= einsum('bjc,iac->ijab',_WvOoV,t2[:,ki,ka].transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    #
+                    # the misfit stragglers... other Wovov terms that don't quite fit in
+                    #
+                    #          "We're all misfits!"
+                    #                  - Island of Unwanted Toys
+                    #
+
+                    ###################################
+                    # Wovov term (kk,kb,ki,kc)
+                    ###################################
+                    _WOvoV = _cp(eris.ovov[:,kb,ki]).transpose(2,3,0,1,4).reshape(nvir,nocc,-1)                          #ovov[*,kb,ki,*]
+                    _WOvoV -= einsum('lic,lb->bic',eris.ooov[:,kb,ki].transpose(2,3,0,1,4).reshape(nocc,nocc,-1),t1[kb]) #ooov[*,kb,ki,*]
+                    _WOvoV += einsum('bdc,id->bic',eris.ovvv[:,kb,ki].transpose(2,3,0,1,4).reshape(nvir,nvir,-1),t1[ki]) #ovvv[*,kb,ki,*]
+
+                    # kk free, kc fixed by kk,kb,ki
+                    # kl free, kd fixed by kk,kl,kc
+                    oOVv = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,ki,kb]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,kb,ki]
+                            oOVv[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = eris.oovv[kl,kk,kc].transpose(0,3,1,2).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,ki,kb].copy()
+                    tau2_OovV[kb] += 2*einsum('id,lb->libd',t1[ki],t1[kb])
+                    _WOvoV -= 0.5*einsum('dc,ibd->bic',oOVv,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    t2new[ki,kj,ka] -= einsum('bic,jac->ijab',_WOvoV,t2[:,kj,ka].transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    ###################################
+                    # Wovov term (kk,ka,kj,kc)
+                    ###################################
+                    _WOvoV = _cp(eris.ovov[:,ka,kj]).transpose(2,3,0,1,4).reshape(nvir,nocc,-1)                          #ovov[*,ka,kj,*]
+                    _WOvoV -= einsum('ljc,la->ajc',eris.ooov[:,ka,kj].transpose(2,3,0,1,4).reshape(nocc,nocc,-1),t1[ka]) #ooov[*,ka,kj,*]
+                    _WOvoV += einsum('adc,jd->ajc',eris.ovvv[:,ka,kj].transpose(2,3,0,1,4).reshape(nvir,nvir,-1),t1[kj]) #ovvv[*,ka,kj,*]
+
+                    # kk free, kc fixed by kk,ka,kj
+                    # kl free, kd fixed by kk,kl,kc
+                    oOVv = numpy.empty((nkpts*nocc*nvir,nkpts*nocc*nvir),dtype=t2.dtype)
+                    for kk in range(nkpts):
+                        kc = kconserv[kk,kj,ka]
+                        for kl in range(nkpts):
+                            kd = kconserv[kl,ka,kj]
+                            oOVv[kl*nocc*nvir:(kl+1)*nocc*nvir,kk*nocc*nvir:(kk+1)*nocc*nvir] = eris.oovv[kl,kk,kc].transpose(0,3,1,2).reshape(nocc*nvir,nocc*nvir)
+                    tau2_OovV  = t2[:,kj,ka].copy()
+                    tau2_OovV[ka] += 2*einsum('jd,la->ljad',t1[kj],t1[ka])
+                    _WOvoV -= 0.5*einsum('dc,jad->ajc',oOVv,tau2_OovV.transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+                    t2new[ki,kj,ka] -= einsum('ajc,ibc->ijab',_WOvoV,t2[:,ki,kb].transpose(2,3,0,1,4).reshape(nocc,nvir,-1))
+
+
             loader.slave_finished()
 
+    cc.comm.Barrier()
     cc.comm.Allreduce(MPI.IN_PLACE, t2new, op=MPI.SUM)
-
 
     eia = numpy.zeros(shape=t1new.shape, dtype=t1new.dtype)
     for ki in range(nkpts):
@@ -807,20 +957,22 @@ class _ERIS:
             _tmpfile1_name = cc.comm.bcast(_tmpfile1_name, root=0)
             print _tmpfile1_name
 ######
-            #self.feri1 = h5py.File(_tmpfile1_name, 'r', driver='mpio', comm=MPI.COMM_WORLD)
-            #self.oooo  = self.feri1['oooo']
-            #self.ooov  = self.feri1['ooov']
-            #self.ovoo  = self.feri1['ovoo']
-            #self.oovv  = self.feri1['oovv']
-            #self.ooVv  = self.feri1['ooVv']
-            #self.oOvv  = self.feri1['oOvv']
-            #self.ovov  = self.feri1['ovov']
-            #self.ovvo  = self.feri1['ovvo']
-            #self.ovvv  = self.feri1['ovvv']
-            #self.vvvv  = self.feri1['vvvv']
-            #self.Soovv = self.feri1['Soovv']
-            #self.SoOvv = self.feri1['SoOvv']
-            #return
+            self.feri1 = h5py.File(_tmpfile1_name, 'r', driver='mpio', comm=MPI.COMM_WORLD)
+            self.oooo  = self.feri1['oooo']
+            self.ooov  = self.feri1['ooov']
+            self.ovoo  = self.feri1['ovoo']
+            self.oovv  = self.feri1['oovv']
+            self.ooVv  = self.feri1['ooVv']
+            self.oOvv  = self.feri1['oOvv']
+            self.ovov  = self.feri1['ovov']
+            self.ovvo  = self.feri1['ovvo']
+            self.voov  = self.feri1['voov']
+            self.ovvv  = self.feri1['ovvv']
+            self.vovv  = self.feri1['vovv']
+            self.vvvv  = self.feri1['vvvv']
+            self.Soovv = self.feri1['Soovv']
+            self.SoOvv = self.feri1['SoOvv']
+            return
 ######
             self.feri1 = h5py.File(_tmpfile1_name, 'w', driver='mpio', comm=MPI.COMM_WORLD)
 
@@ -836,7 +988,9 @@ class _ERIS:
 
             self.ovov  = self.feri1.create_dataset('ovov',  (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
             self.ovvo  = self.feri1.create_dataset('ovvo',  (nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc), dtype=ds_type)
+            self.voov  = self.feri1.create_dataset('voov',  (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
             self.ovvv  = self.feri1.create_dataset('ovvv',  (nkpts,nkpts,nkpts,nocc,nvir,nvir,nvir), dtype=ds_type)
+            self.vovv  = self.feri1.create_dataset('vovv',  (nkpts,nkpts,nkpts,nvir,nocc,nvir,nvir), dtype=ds_type)
             self.vvvv  = self.feri1.create_dataset('vvvv',  (nkpts,nkpts,nkpts,nvir,nvir,nvir,nvir), dtype=ds_type)
 
             self.Soovv = self.feri1.create_dataset('Soovv', (nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=ds_type)
@@ -963,7 +1117,7 @@ class _ERIS:
             loader1.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 
             tmp_block_shape = BLKSIZE + (nocc,nvir,nmo,nmo)
-            tmp_block = numpy.empty(shape=tmp_block_shape,dtype=ds_type)
+            tmp_block  = numpy.empty(shape=tmp_block_shape,dtype=ds_type)
 
             cput1 = time.clock(), time.time()
             good2go = True
@@ -985,6 +1139,8 @@ class _ERIS:
                             eri_kpt = eri_kpt.reshape(nocc,nmo,nvir,nmo)
                             eri_kpt = eri_kpt.transpose(0,2,1,3) / nkpts
                             tmp_block[kp-ranges0[0],kr-ranges1[0],kq-ranges2[0]] = eri_kpt
+                            self.voov[kr,kp,ks] = eri_kpt.transpose(1,0,3,2)[:,:,:nocc,nocc:]
+                            self.vovv[kr,kp,ks] = eri_kpt.transpose(1,0,3,2)[:,:,nocc:,nocc:]
                             ######################################################
                             # Storing in physics notation... note it's kp,kr,kq  #
                             # and not kp,kq,kr...                                #
@@ -1101,7 +1257,9 @@ class _ERIS:
 
             self.ovov  = self.feri1['ovov']
             self.ovvo  = self.feri1['ovvo']
+            self.voov  = self.feri1['voov']
             self.ovvv  = self.feri1['ovvv']
+            self.vovv  = self.feri1['vovv']
             self.vvvv  = self.feri1['vvvv']
 
             self.Soovv = self.feri1['Soovv']

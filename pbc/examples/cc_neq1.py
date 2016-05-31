@@ -16,12 +16,12 @@ def run_krccsd(mf):
     cc.kernel()
     return cc
 
-def run_ip_krccsd(cc, nroots=9, klist=None):
+def run_ip_krccsd(cc, nroots=1, klist=None):
     e,c = cc.ipccsd(nroots, klist)
     comm.Barrier()
     return e,c
 
-def run_ea_krccsd(cc, nroots=9, klist=None):
+def run_ea_krccsd(cc, nroots=1, klist=None):
     e,c = cc.eaccsd(nroots, klist)
     comm.Barrier()
     return e,c

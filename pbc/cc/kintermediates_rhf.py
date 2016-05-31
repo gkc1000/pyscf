@@ -1,10 +1,12 @@
 import numpy as np
 import time
 import pyscf.pbc.tools as tools
+from mpi4py import MPI
 from pyscf.lib import logger
 import mpi_load_balancer
 from pyscf import lib
 from pyscf.pbc import lib as pbclib
+from pyscf.cc.ccsd import _cp
 
 #einsum = np.einsum
 einsum = pbclib.einsum
@@ -18,7 +20,7 @@ dot = np.dot
 
 ### Eqs. (37)-(39) "kappa"
 
-@profile
+#@profile
 def cc_tau1(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -66,55 +68,62 @@ def cc_tau1(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-@profile
+#@profile
 def cc_Foo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
     Fki = np.empty((nkpts,nocc,nocc),dtype=t2.dtype)
 
-    tau1_oOvv = feri2['tau1_oOvv']
     for ki in range(nkpts):
         kk = ki
         Fki[ki] = eris.fock[ki,:nocc,:nocc].copy()
-        for kc in range(nkpts):
-            Fki[ki] += einsum('lkcd,licd->ki',eris.SoOvv[kk,kc],tau1_oOvv[ki,kc])
-            #for kl in range(nkpts):
-            #    kd = kconserv[kk,kc,kl]
-            #    Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-            #    Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
-            ##if ki == kc:
-            #kd = kconserv[kk,ki,kl]
-            #Soovv = 2*eris.oovv[kk,kl,ki] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-            #Fki[ki] += einsum('klcd,ic,ld->ki',Soovv,t1[ki],t1[kl])
+        for kl in range(nkpts):
+            for kc in range(nkpts):
+            #Fki[ki] += einsum('lkcd,licd->ki',eris.SoOvv[kk,kc],tau1_oOvv[ki,kc])
+                kd = kconserv[kk,kc,kl]
+                Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
+                Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
+            #if ki == kc:
+            kd = kconserv[kk,ki,kl]
+            Soovv = 2*eris.oovv[kk,kl,ki] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
+            Fki[ki] += einsum('klcd,ic,ld->ki',Soovv,t1[ki],t1[kl])
     return Fki
 
-@profile
+#@profile
 def cc_Fvv(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
     Fac = np.empty((nkpts,nvir,nvir),dtype=t2.dtype)
 
-    tau1_oOvv = feri2['tau1_oOvv']
     for ka in range(nkpts):
         kc = ka
         Fac[ka] = eris.fock[ka,nocc:,nocc:].copy()
-        for kk in range(nkpts):
-            Fac[ka] += -einsum('lkcd,lkad->ac',eris.SoOvv[kk,kc],tau1_oOvv[kk,ka])
-
+        #for kk in range(nkpts):
+        #    Fac[ka] += -einsum('lkcd,lkad->ac',eris.SoOvv[kk,kc],tau1_oOvv[kk,ka])
+        for kl in range(nkpts):
+            for kk in range(nkpts):
+                kd = kconserv[kk,kc,kl]
+                Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
+                Fac[ka] += -einsum('klcd,klad->ac',Soovv,t2[kk,kl,ka])
+            #if kk == ka
+            kd = kconserv[ka,kc,kl]
+            Soovv = 2*eris.oovv[ka,kl,kc] - eris.oovv[ka,kl,kd].transpose(0,1,3,2)
+            Fac[ka] += -einsum('klcd,ka,ld->ac',Soovv,t1[ka],t1[kl])
     return Fac
 
-@profile
 def cc_Fov(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     Fkc = np.empty((nkpts,nocc,nvir),dtype=t2.dtype)
     Fkc[:] = eris.fock[:,:nocc,nocc:].copy()
     for kk in range(nkpts):
-        Fkc[kk] += einsum('lkcd,ld->kc',eris.SoOvv[kk,kk],t1.reshape(nkpts*nocc,nvir))
+        for kl in range(nkpts):
+            Soovv = 2.*eris.oovv[kk,kl,kk] - eris.oovv[kk,kl,kl].transpose(0,1,3,2)
+            Fkc[kk] += einsum('klcd,ld->kc',Soovv,t1[kl])
     return Fkc
 
 ### Eqs. (40)-(41) "lambda"
 
-@profile
+#@profile
 def Loo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     fov = eris.fock[:,:nocc,nocc:]
@@ -125,7 +134,7 @@ def Loo(cc,t1,t2,eris,feri2=None):
         Lki[ki] += einsum('lkic,lc->ki',SoOov,t1.reshape(nkpts*nocc,nvir))
     return Lki
 
-@profile
+#@profile
 def Lvv(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     fov = eris.fock[:,:nocc,nocc:]
@@ -139,7 +148,7 @@ def Lvv(cc,t1,t2,eris,feri2=None):
 
 ### Eqs. (42)-(45) "chi"
 
-@profile
+#@profile
 def cc_Woooo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -199,7 +208,7 @@ def cc_Woooo(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-@profile
+#@profile
 def cc_Wvvvv(cc,t1,t2,eris,feri2=None):
     ## Slow:
     nkpts, nocc, nvir = t1.shape
@@ -239,7 +248,7 @@ def cc_Wvvvv(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-@profile
+#@profile
 def cc_Wvoov(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -302,7 +311,7 @@ def cc_Wvoov(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-@profile
+#@profile
 def cc_Wvovo(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -358,7 +367,7 @@ def cc_Wvovo(cc,t1,t2,eris,feri2=None):
     cc.comm.Barrier()
     return
 
-@profile
+#@profile
 def cc_Wovov(cc,t1,t2,eris,feri2=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -420,213 +429,1063 @@ def cc_Wovov(cc,t1,t2,eris,feri2=None):
 
 # Indices in the following can be safely permuted.
 
-def Wooov(cc,t1,t2,eris):
+def Wooov(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wklid = np.array(eris.ooov, copy=True)
-    for kk in range(nkpts):
-        for kl in range(nkpts):
-            for ki in range(nkpts):
-                kd = kconserv[kk,ki,kl]
-                Wklid[kk,kl,ki] += einsum('ic,klcd->klid',t1[ki],eris.oovv[kk,kl,ki])
+    if fint is None:
+        Wklid = np.zeros((nkpts,nkpts,nkpts,nocc,nocc,nocc,nvir),dtype=t2.dtype)
+    else:
+        Wklid = fint['Wooov']
+
+# TODO can do much better than this... call recursive function
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    ooov_tmp_size = BLKSIZE + (nocc,nocc,nocc,nvir)
+    ooov_tmp = np.empty(ooov_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_ooov_kli = _cp(eris.ooov[s0,s1,s2])
+        eris_oovv_kli = _cp(eris.oovv[s0,s1,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkl,kl in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kd = kconserv[kk,ki,kl]
+                    ooov_tmp[iterkk,iterkl,iterki] = eris_ooov_kli[iterkk,iterkl,iterki].copy()
+                    ooov_tmp[iterkk,iterkl,iterki] += einsum('ic,klcd->klid',t1[ki],eris_oovv_kli[iterkk,iterkl,iterki])
+        Wklid[s0,s1,s2] = ooov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wklid, op=MPI.SUM)
+
     return Wklid
 
-def Wvovv(cc,t1,t2,eris):
+
+def Wvovv(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Walcd = np.empty((nkpts,nkpts,nkpts,nvir,nocc,nvir,nvir),dtype=t1.dtype)
-    for ka in range(nkpts):
-        for kl in range(nkpts):
-            for kc in range(nkpts):
-                kd = kconserv[ka,kc,kl]
-                # vovv[ka,kl,kc,kd] <= ovvv[kl,ka,kd,kc].transpose(1,0,3,2)
-                Walcd[ka,kl,kc] = np.array(eris.ovvv[kl,ka,kd]).transpose(1,0,3,2)
-                Walcd[ka,kl,kc] += -einsum('ka,klcd->alcd',t1[ka],eris.oovv[ka,kl,kc])
+    if fint is None:
+        Walcd = np.zeros((nkpts,nkpts,nkpts,nvir,nocc,nvir,nvir),dtype=t2.dtype)
+    else:
+        Walcd = fint['Wvovv']
+
+# TODO can do much better than this... call recursive function
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nvir*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    vovv_tmp_size = BLKSIZE + (nvir,nocc,nvir,nvir)
+    vovv_tmp = np.empty(vovv_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_vovv_alc = _cp(eris.vovv[s0,s1,s2])
+        eris_oovv_alc = _cp(eris.oovv[s0,s1,s2])
+
+        for iterka,ka in enumerate(ranges0):
+            for iterkl,kl in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    kd = kconserv[ka,kc,kl]
+                    # vovv[ka,kl,kc,kd] <= ovvv[kl,ka,kd,kc].transpose(1,0,3,2)
+                    vovv_tmp[iterka,iterkl,iterkc] = eris_vovv_alc[iterka,iterkl,iterkc] #np.array(eris.ovvv[kl,ka,kd]).transpose(1,0,3,2)
+                    vovv_tmp[iterka,iterkl,iterkc] += -einsum('ka,klcd->alcd',t1[ka],eris_oovv_alc[iterka,iterkl,iterkc])
+        Walcd[s0,s1,s2] = vovv_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Walcd, op=MPI.SUM)
+
     return Walcd
 
-def W1ovvo(cc,t1,t2,eris):
+def W1ovvo(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wkaci = np.empty((nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc),dtype=t1.dtype)
-    for kk in range(nkpts):
-        for ka in range(nkpts):
-            for kc in range(nkpts):
-                ki = kconserv[kk,kc,ka]
-                # ovvo[kk,ka,kc,ki] => voov[ka,kk,ki,kc]
-                Wkaci[kk,ka,kc] = np.array(eris.voov[ka,kk,ki]).transpose(1,0,3,2)
-                for kl in range(nkpts):
-                    kd = kconserv[ki,ka,kl]
-                    St2 = 2.*t2[ki,kl,ka] - t2[kl,ki,ka].transpose(1,0,2,3)
-                    Wkaci[kk,ka,kc] +=  einsum('klcd,ilad->kaci',eris.oovv[kk,kl,kc],St2)
-                    Wkaci[kk,ka,kc] += -einsum('kldc,ilad->kaci',eris.oovv[kk,kl,kd],t2[ki,kl,ka])
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc),dtype=t1.dtype)
+    else:
+        Wkaci  = fint['W1ovvo']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    ovvo_tmp_size = BLKSIZE + (nocc,nvir,nvir,nocc)
+    ovvo_tmp = np.empty(ovvo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        eris_ovvo_kac = _cp(eris.ovvo[s0,s1,s2])
+        eris_oovv_kXc = _cp(eris.oovv[s0,:,s2])
+        eris_oovv_Xkc = _cp(eris.oovv[:,s0,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterka,ka in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    ki = kconserv[kk,kc,ka]
+                    ovvo_tmp[iterkk,iterka,iterkc] = _cp(eris_ovvo_kac[iterkk,iterka,iterkc])
+                    St2 = 2.*t2[ki,:,ka] - t2[:,ki,ka].transpose(0,2,1,3,4)
+                    ovvo_tmp[iterkk,iterka,iterkc] += einsum('klcd,ilad->kaci',eris_oovv_kXc[iterkk,:,iterkc].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir),
+                                                                St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    ovvo_tmp[iterkk,iterka,iterkc] += -einsum('lkcd,ilad->kaci',eris_oovv_Xkc[:,iterkk,iterkc].reshape(nocc*nkpts,nocc,nvir,nvir),
+                                                                t2[ki,:,ka].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+        Wkaci[s0,s1,s2] = ovvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
     return Wkaci
 
-def W2ovvo(cc,t1,t2,eris):
+def W2ovvo(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wkaci = np.empty((nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc),dtype=t1.dtype)
-    WWooov = Wooov(cc,t1,t2,eris)
-    for kk in range(nkpts):
-        for ka in range(nkpts):
-            for kc in range(nkpts):
-                ki = kconserv[kk,kc,ka]
-                Wkaci[kk,ka,kc] =  einsum('la,lkic->kaci',-t1[ka],WWooov[ka,kk,ki])
-                Wkaci[kk,ka,kc] += einsum('akdc,id->kaci',eris.vovv[ka,kk,ki],t1[ki])
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc),dtype=t1.dtype)
+        WWooov = Wooov(cc,t1,t2,eris)
+    else:
+        Wkaci  = fint['W2ovvo']
+        WWooov = fint['Wooov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    ovvo_tmp_size = BLKSIZE + (nocc,nvir,nvir,nocc)
+    ovvo_tmp = np.empty(ovvo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        Wooov_akX     = _cp(WWooov[s1,s0])
+        eris_ovvv_kac = _cp(eris.ovvv[s0,s1,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterka,ka in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    ki = kconserv[kk,kc,ka]
+                    ovvo_tmp[iterkk,iterka,iterkc] = einsum('la,lkic->kaci',-t1[ka],Wooov_akX[iterka,iterkk,ki])
+                    ovvo_tmp[iterkk,iterka,iterkc] += einsum('akdc,id->kaci',eris_ovvv_kac[iterkk,iterka,iterkc].transpose(1,0,3,2),t1[ki])
+
+        Wkaci[s0,s1,s2] = ovvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
     return Wkaci
 
-def Wovvo(cc,t1,t2,eris):
+
+def Wovvo(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    return W1ovvo(cc,t1,t2,eris) + W2ovvo(cc,t1,t2,eris)
+    if fint is None:
+        Wkaci = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc),dtype=t2.dtype)
+        W1kaci = W1ovvo(cc,t1,t2,eris,fint)
+        W2kaci = W2ovvo(cc,t1,t2,eris,fint)
+    else:
+        Wkaci = fint['Wovvo']
+        W1kaci = fint['W1ovvo']
+        W2kaci = fint['W2ovvo']
 
-def W1ovov(cc,t1,t2,eris):
+# TODO can do much better than this... call recursive function
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        Wkaci[s0,s1,s2] = _cp(W1kaci[s0,s1,s2]) + _cp(W2kaci[s0,s1,s2])
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
+    return Wkaci
+
+def W1ovov(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wkbid = np.array(eris.ovov, copy=True)
-    for kk in range(nkpts):
-        for kb in range(nkpts):
-            for ki in range(nkpts):
-                kd = kconserv[kk,ki,kb]
-                #   kk + kl - kc - kd = 0
-                # => kc = kk - kd + kl
-                for kl in range(nkpts):
-                    kc = kconserv[kk,kd,kl]
-                    Wkbid[kk,kb,ki] += -einsum('klcd,ilcb->kbid',eris.oovv[kk,kl,kc],t2[ki,kl,kc])
+    if fint is None:
+        Wkbid = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir),dtype=t2.dtype)
+    else:
+        Wkbid = fint['W1ovov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    ovov_tmp_size = BLKSIZE + (nocc,nvir,nocc,nvir)
+    ovov_tmp = np.empty(ovov_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_ovov = _cp(eris.ovov[s0,s1,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kd = kconserv[kk,ki,kb]
+                    ovov_tmp[iterkk,iterkb,iterki] = eris_ovov[iterkk,iterkb,iterki].copy()
+                    ovov_tmp[iterkk,iterkb,iterki] += -einsum('lkdc,libc->kbid',eris.oovv[:,kk,kd].reshape(nkpts*nocc,nocc,nvir,nvir),
+                                                              t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir))
+        Wkbid[s0,s1,s2] = ovov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkbid, op=MPI.SUM)
+
     return Wkbid
 
-def W2ovov(cc,t1,t2,eris):
+def W2ovov(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wkbid = np.empty((nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir),dtype=t1.dtype)
-    WWooov = Wooov(cc,t1,t2,eris)
-    for kk in range(nkpts):
-        for kb in range(nkpts):
-            for ki in range(nkpts):
-                kd = kconserv[kk,ki,kb]
-                Wkbid[kk,kb,ki] = einsum('klid,lb->kbid',WWooov[kk,kb,ki],-t1[kb])
-                Wkbid[kk,kb,ki] += einsum('bkdc,ic->kbid',eris.vovv[kb,kk,kd],t1[ki])
+    if fint is None:
+        Wkbid = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir),dtype=t2.dtype)
+        WWooov = Wooov(cc,t1,t2,eris)
+    else:
+        Wkbid = fint['W2ovov']
+        WWooov = fint['Wooov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    ovov_tmp_size = BLKSIZE + (nocc,nvir,nocc,nvir)
+    ovov_tmp = np.empty(ovov_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_ovvv  = _cp(eris.ovvv[s0,s1,s2])
+        WWooov_kbi = _cp(WWooov[s0,s1,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kd = kconserv[kk,ki,kb]
+                    ovov_tmp[iterkk,iterkb,iterki] = einsum('klid,lb->kbid',WWooov_kbi[iterkk,iterkb,iterki],-t1[kb])
+                    ovov_tmp[iterkk,iterkb,iterki] += einsum('kbcd,ic->kbid',eris_ovvv[iterkk,iterkb,iterki],t1[ki])
+        Wkbid[s0,s1,s2] = ovov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkbid, op=MPI.SUM)
+
     return Wkbid
 
-def Wovov(cc,t1,t2,eris):
-    nkpts, nocc, nvir = t1.shape
-    kconserv = cc.kconserv
-    return W1ovov(cc,t1,t2,eris) + W2ovov(cc,t1,t2,eris)
-
-def Woooo(cc,t1,t2,eris):
+def Wovov(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wklij = np.array(eris.oooo, copy=True)
-    for kk in range(nkpts):
-        for kl in range(nkpts):
-            for ki in range(nkpts):
-                kj = kconserv[kk,ki,kl]
-                for kc in range(nkpts):
-                    kd = kconserv[kk,kc,kl]
-                    Wklij[kk,kl,ki] += einsum('klcd,ijcd->klij',eris.oovv[kk,kl,kc],t2[ki,kj,kc])
-                Wklij[kk,kl,ki] += einsum('klcd,ic,jd->klij',eris.oovv[kk,kl,ki],t1[ki],t1[kd])
-                Wklij[kk,kl,ki] += einsum('klid,jd->klij',eris.ooov[kk,kl,ki],t1[kj])
-                Wklij[kk,kl,ki] += einsum('lkjc,ic->klij',eris.ooov[kl,kk,kj],t1[ki])
+    if fint is None:
+        Wkbid = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir),dtype=t2.dtype)
+        WW1ovov = W1ovov(cc,t1,t2,eris)
+        WW2ovov = W2ovov(cc,t1,t2,eris)
+    else:
+        Wkbid = fint['Wovov']
+        WW1ovov = fint['W1ovov']
+        WW2ovov = fint['W2ovov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    ovov_tmp_size = BLKSIZE + (nocc,nvir,nocc,nvir)
+    ovov_tmp = np.empty(ovov_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        Wkbid[s0,s1,s2] = _cp(WW1ovov[s0,s1,s2]) + _cp(WW2ovov[s0,s1,s2])
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkbid, op=MPI.SUM)
+
+    return Wkbid
+
+
+def WovovRev(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wkbid = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir),dtype=t2.dtype)
+        WW1ovov = W1ovov(cc,t1,t2,eris)
+        WW2ovov = W2ovov(cc,t1,t2,eris)
+    else:
+        Wkbid = fint['WovovRev']
+        WW1ovov = fint['W1ovov']
+        WW2ovov = fint['W2ovov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    ovov_tmp_size = BLKSIZE + (nocc,nvir,nocc,nvir)
+    ovov_tmp = np.empty(ovov_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        Wkbid[s2,s1,s0] = (_cp(WW1ovov[s0,s1,s2]) + _cp(WW2ovov[s0,s1,s2])).transpose(2,1,0,3,4,5,6)
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkbid, op=MPI.SUM)
+
+    return Wkbid
+
+
+
+##################################################
+# This is the same Woooo intermediate used in cc?#
+##################################################
+
+def Woooo(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wklij = np.zeros((nkpts,nkpts,nkpts,nocc,nocc,nocc,nocc),dtype=t2.dtype)
+    else:
+        Wklij = fint['Woooo']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    oooo_tmp_size = BLKSIZE + (nocc,nocc,nocc,nocc)
+    oooo_tmp = np.empty(oooo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_oovv_klX = _cp(eris.oovv[s0,s1,s2])
+        eris_oooo_kli = _cp(eris.oooo[s0,s1,s2])
+        eris_ooov_klX = _cp(eris.ooov[s0,s1,s2])
+        eris_ooov_lkX = _cp(eris.ooov[s1,s0,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkl,kl in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kj = kconserv[kk,ki,kl]
+                    tau1 = t2[ki,kj,:].copy()
+                    tau1[ki] += einsum('ic,jd->ijcd',t1[ki],t1[kj])
+                    oooo_tmp[iterkk,iterkl,iterki] = eris_oooo_kli[iterkk,iterkl,iterki].copy()
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('kld,ijd->klij',eris_oovv_klX[iterkk,iterkl,:].transpose(1,2,0,3,4).reshape(nocc,nocc,-1),
+                                                                 tau1.transpose(1,2,0,3,4).reshape(nocc,nocc,-1))
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('klid,jd->klij',eris_ooov_klX[iterkk,iterkl,ki],t1[kj])
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('lkjc,ic->klij',eris_ooov_lkX[iterkl,iterkk,kj],t1[ki])
+        Wklij[s0,s1,s2] = oooo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wklij, op=MPI.SUM)
+
     return Wklij
 
-def Wvvvv(cc,t1,t2,eris):
+# This has different storage compared to Woooo, more amenable to I/O
+# Instead of calling Woooo[kk,kl,ki] to get Woooo[kk,kl,ki,kj] you call
+# WooooS[kl,ki,kj]
+def WooooS(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wabcd = np.array(eris.vvvv, copy=True)
-    for ka in range(nkpts):
-        for kb in range(nkpts):
-            for kc in range(nkpts):
-                kd = kconserv[ka,kc,kb]
-                for kk in range(nkpts):
-                    # kk + kl - kc - kd = 0
-                    # => kl = kc - kk + kd
-                    kl = kconserv[kc,kk,kd]
-                    Wabcd[ka,kb,kc] += einsum('klcd,klab->abcd',eris.oovv[kk,kl,kc],t2[kk,kl,ka])
-                Wabcd[ka,kb,kc] += einsum('klcd,ka,lb->abcd',eris.oovv[ka,kb,kc],t1[ka],t1[kb])
-                Wabcd[ka,kb,kc] += einsum('alcd,lb->abcd',eris.vovv[ka,kb,kc],-t1[kb])
-                Wabcd[ka,kb,kc] += einsum('bkdc,ka->abcd',eris.vovv[kb,ka,kd],-t1[ka])
+    if fint is None:
+        Wklij = np.zeros((nkpts,nkpts,nkpts,nocc,nocc,nocc,nocc),dtype=t2.dtype)
+    else:
+        Wklij = fint['WooooS']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    oooo_tmp_size = BLKSIZE + (nocc,nocc,nocc,nocc)
+    oooo_tmp = np.empty(oooo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_oovv_klX = _cp(eris.oovv[s0,s1,s2])
+        eris_oooo_kli = _cp(eris.oooo[s0,s1,s2])
+        eris_ooov_klX = _cp(eris.ooov[s0,s1,s2])
+        eris_ooov_lkX = _cp(eris.ooov[s1,s0,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkl,kl in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kj = kconserv[kk,ki,kl]
+                    tau1 = t2[ki,kj,:].copy()
+                    tau1[ki] += einsum('ic,jd->ijcd',t1[ki],t1[kj])
+                    oooo_tmp[iterkk,iterkl,iterki] = eris_oooo_kli[iterkk,iterkl,iterki].copy()
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('kld,ijd->klij',eris_oovv_klX[iterkk,iterkl,:].transpose(1,2,0,3,4).reshape(nocc,nocc,-1),
+                                                                 tau1.transpose(1,2,0,3,4).reshape(nocc,nocc,-1))
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('klid,jd->klij',eris_ooov_klX[iterkk,iterkl,ki],t1[kj])
+                    oooo_tmp[iterkk,iterkl,iterki] += einsum('lkjc,ic->klij',eris_ooov_lkX[iterkl,iterkk,kj],t1[ki])
+                    Wklij[kl,ki,kj] = oooo_tmp[iterkk,iterkl,iterki]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wklij, op=MPI.SUM)
+
+    return Wklij
+
+def Wvvvv(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wabcd = np.zeros((nkpts,nkpts,nkpts,nvir,nvir,nvir,nvir),dtype=t2.dtype)
+    else:
+        Wabcd = fint['Wvvvv']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nvir*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    vvvv_tmp_size = BLKSIZE + (nvir,nvir,nvir,nvir)
+    vvvv_tmp = np.empty(vvvv_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_vovv = _cp(eris.vovv[s0,s1,s2])
+        eris_ovvv = _cp(eris.ovvv[s0,s1,s2])
+        eris_oovv_abc = _cp(eris.oovv[s0,s1,s2])
+
+        vvvv_tmp = _cp(eris.vvvv[s0,s1,s2])
+        for iterka,ka in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    kd = kconserv[ka,kc,kb]
+                    vvvv_tmp[iterka,iterkb,iterkc] += einsum('klcd,ka,lb->abcd',eris_oovv_abc[iterka,iterkb,iterkc],t1[ka],t1[kb])
+                    for kk in range(nkpts):
+                        # kk + kl - kc - kd = 0
+                        # => kl = kc - kk + kd
+                        kl = kconserv[kc,kk,kd]
+                        vvvv_tmp[iterka,iterkb,iterkc] += einsum('klcd,klab->abcd',eris.oovv[kk,kl,kc],t2[kk,kl,ka])
+                    vvvv_tmp[iterka,iterkb,iterkc] += einsum('alcd,lb->abcd',eris_vovv[iterka,iterkb,iterkc],-t1[kb])
+                    #vvvv_tmp[iterka,iterkb,iterkc] += einsum('bkdc,ka->abcd',eris.vovv[kb,ka,kd],-t1[ka])
+                    vvvv_tmp[iterka,iterkb,iterkc] += einsum('kbcd,ka->abcd',eris_ovvv[iterka,iterkb,iterkc],-t1[ka])
+        Wabcd[s0,s1,s2] = vvvv_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wabcd, op=MPI.SUM)
+
     return Wabcd
 
-def Wvvvo(cc,t1,t2,eris):
+def Wvvvo(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    Wabcj = np.empty((nkpts,nkpts,nkpts,nvir,nvir,nvir,nocc),dtype=t1.dtype)
-    WWvvvv = Wvvvv(cc,t1,t2,eris)
-    WW1ovov = W1ovov(cc,t1,t2,eris)
-    WW1ovvo = W1ovvo(cc,t1,t2,eris)
-    FFov = cc_Fov(cc,t1,t2,eris)
-    for ka in range(nkpts):
-        for kb in range(nkpts):
-            for kc in range(nkpts):
-                kj = kconserv[ka,kc,kb]
-                # vvvo[ka,kb,kc,kj] <= vovv[kc,kj,ka,kb].transpose(2,3,0,1).conj()
-                Wabcj[ka,kb,kc] = np.array(eris.vovv[kc,kj,ka]).transpose(2,3,0,1).conj()
-                Wabcj[ka,kb,kc] += einsum('abcd,jd->abcj',WWvvvv[ka,kb,kc],t1[kj])
-                # Wvovo[ka,kl,kc,kj] <= Wovov[kl,ka,kj,kc].transpose(1,0,3,2)
-                Wabcj[ka,kb,kc] += einsum('alcj,lb->abcj',WW1ovov[kb,ka,kj].transpose(1,0,3,2),-t1[kb])
-                Wabcj[ka,kb,kc] += einsum('kbcj,ka->abcj',WW1ovvo[ka,kb,kc],-t1[ka])
+    if fint is None:
+        Wabcj = np.zeros((nkpts,nkpts,nkpts,nvir,nvir,nvir,nocc),dtype=t2.dtype)
+        WWvvvv = Wvvvv(cc,t1,t2,eris)
+        WW1ovov = W1ovov(cc,t1,t2,eris)
+        WW1ovvo = W1ovvo(cc,t1,t2,eris)
+        FFov = cc_Fov(cc,t1,t2,eris)
+    else:
+        Wabcj = fint['Wvvvo']
+        WWvvvv = fint['Wvvvv']
+        WW1ovov = fint['W1ovov']
+        WW1voov = fint['W1voov']
+        FFov = cc_Fov(cc,t1,t2,eris)
 
-                for kl in range(nkpts):
-                    # ka + kl - kc - kd = 0
-                    # => kd = ka - kc + kl
-                    kd = kconserv[ka,kc,kl]
-                    St2 = 2.*t2[kl,kj,kd] - t2[kl,kj,kb].transpose(0,1,3,2)
-                    Wabcj[ka,kb,kc] += einsum('alcd,ljdb->abcj',eris.vovv[ka,kl,kc], St2)
-                    Wabcj[ka,kb,kc] += einsum('aldc,ljdb->abcj',eris.vovv[ka,kl,kd], -t2[kl,kj,kd])
-                    # kb - kc + kl = kd
-                    kd = kconserv[kb,kc,kl]
-                    Wabcj[ka,kb,kc] += einsum('bldc,jlda->abcj',eris.vovv[kb,kl,kd], -t2[kj,kl,kd])
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (1,nkpts_blksize2,nkpts_blksize,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    vvvo_tmp_size = BLKSIZE + (nvir,nvir,nvir,nocc)
+    vvvo_tmp = np.empty(vvvo_tmp_size,dtype=t2.dtype)
 
-                    # kl + kk - kb - ka = 0
-                    # => kk = kb + ka - kl
-                    kk = kconserv[kb,kl,ka]
-                    Wabcj[ka,kb,kc] += einsum('lkjc,lkba->abcj',eris.ooov[kl,kk,kj],t2[kl,kk,kb])
-                Wabcj[ka,kb,kc] += einsum('lkjc,lb,ka->abcj',eris.ooov[kb,ka,kj],t1[kb],t1[ka])
-                Wabcj[ka,kb,kc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_vovv_aXc = _cp(eris.vovv[s0,:,s2])
+        eris_ovvv_Xac = _cp(eris.ovvv[:,s0,s2])
+        eris_ovvv_Xbc = _cp(eris.ovvv[:,s1,s2])
+
+        Wvvvv_abc = _cp(WWvvvv[s0,s1,s2])
+        W1voov_abc = _cp(WW1voov[s1,s0,:])
+        W1ovov_baX = _cp(WW1ovov[s1,s0,:])
+
+        for iterka,ka in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    kj = kconserv[ka,kc,kb]
+                    vvvo_tmp[iterka,iterkb,iterkc] = np.array(eris.vovv[kc,kj,ka]).transpose(2,3,0,1).conj()
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('abcd,jd->abcj',Wvvvv_abc[iterka,iterkb,iterkc],t1[kj])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lajc,lb->abcj',W1ovov_baX[iterkb,iterka,kj],-t1[kb])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('bkjc,ka->abcj',W1voov_abc[iterkb,iterka,kj],-t1[ka])
+
+                    kl_ranges = range(nkpts)
+                    kd_ranges = kconserv[ka,kc,kl_ranges]
+                    St2 = np.empty((nkpts,nocc,nocc,nvir,nvir),dtype=t2.dtype)
+                    for kl in range(nkpts):
+                        # ka + kl - kc - kd = 0
+                        # => kd = ka - kc + kl
+                        kd = kconserv[ka,kc,kl]
+                        St2[kl] = 2.*t2[kl,kj,kd] - t2[kl,kj,kb].transpose(0,1,3,2)
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('alcd,ljdb->abcj',
+                                                        eris_vovv_aXc[iterka,:,iterkc].transpose(1,0,2,3,4).reshape(nvir,nkpts*nocc,nvir,nvir),
+                                                        St2.reshape(nkpts*nocc,nocc,nvir,nvir))
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lacd,jlbd->abcj',
+                                                        eris_ovvv_Xac[:,iterka,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
+                                                        -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lbcd,ljad->abcj',
+                                                        eris_ovvv_Xbc[:,iterkb,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
+                                                        -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+                    for kl in range(nkpts):
+                        kk = kconserv[kb,kl,ka]
+                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lkjc,lb,ka->abcj',eris.ooov[kb,ka,kj],t1[kb],t1[ka])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+
+        Wabcj[s0,s1,s2] = vvvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wabcj, op=MPI.SUM)
+
     return Wabcj
 
-def Wovoo(cc,t1,t2,eris):
+def WvvvoR1(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
 
-    WW1ovov = W1ovov(cc,t1,t2,eris)
-    WWoooo = Woooo(cc,t1,t2,eris)
-    WW1ovvo = W1ovvo(cc,t1,t2,eris)
+    if fint is None:
+        Wabcj = np.zeros((nkpts,nkpts,nkpts,nvir,nvir,nvir,nocc),dtype=t2.dtype)
+        WWvvvv = Wvvvv(cc,t1,t2,eris)
+        WW1ovov = W1ovov(cc,t1,t2,eris)
+        WW1ovvo = W1ovvo(cc,t1,t2,eris)
+        FFov = cc_Fov(cc,t1,t2,eris)
+    else:
+        Wabcj = fint['WvvvoR1']
+        WWvvvv = fint['Wvvvv']
+        WW1ovov = fint['W1ovov']
+        WW1voov = fint['W1voov']
+        FFov = cc_Fov(cc,t1,t2,eris)
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (1,nkpts_blksize2,nkpts_blksize,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    vvvo_tmp_size = BLKSIZE + (nvir,nvir,nvir,nocc)
+    vvvo_tmp = np.empty(vvvo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        eris_vovv_aXc = _cp(eris.vovv[s0,:,s2])
+        eris_ovvv_Xac = _cp(eris.ovvv[:,s0,s2])
+        eris_ovvv_Xbc = _cp(eris.ovvv[:,s1,s2])
+
+        Wvvvv_abc = _cp(WWvvvv[s0,s1,s2])
+        W1voov_abc = _cp(WW1voov[s1,s0,:])
+        W1ovov_baX = _cp(WW1ovov[s1,s0,:])
+
+        for iterka,ka in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    kj = kconserv[ka,kc,kb]
+                    vvvo_tmp[iterka,iterkb,iterkc] = np.array(eris.vovv[kc,kj,ka]).transpose(2,3,0,1).conj()
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('abcd,jd->abcj',Wvvvv_abc[iterka,iterkb,iterkc],t1[kj])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lajc,lb->abcj',W1ovov_baX[iterkb,iterka,kj],-t1[kb])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('bkjc,ka->abcj',W1voov_abc[iterkb,iterka,kj],-t1[ka])
+
+                    kl_ranges = range(nkpts)
+                    kd_ranges = kconserv[ka,kc,kl_ranges]
+                    St2 = np.empty((nkpts,nocc,nocc,nvir,nvir),dtype=t2.dtype)
+                    for kl in range(nkpts):
+                        # ka + kl - kc - kd = 0
+                        # => kd = ka - kc + kl
+                        kd = kconserv[ka,kc,kl]
+                        St2[kl] = 2.*t2[kl,kj,kd] - t2[kl,kj,kb].transpose(0,1,3,2)
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('alcd,ljdb->abcj',
+                                                        eris_vovv_aXc[iterka,:,iterkc].transpose(1,0,2,3,4).reshape(nvir,nkpts*nocc,nvir,nvir),
+                                                        St2.reshape(nkpts*nocc,nocc,nvir,nvir))
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lacd,jlbd->abcj',
+                                                        eris_ovvv_Xac[:,iterka,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
+                                                        -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lbcd,ljad->abcj',
+                                                        eris_ovvv_Xbc[:,iterkb,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
+                                                        -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+                    for kl in range(nkpts):
+                        kk = kconserv[kb,kl,ka]
+                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lkjc,lb,ka->abcj',eris.ooov[kb,ka,kj],t1[kb],t1[ka])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+
+        Wabcj[s2,s0,s1] = vvvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)].transpose(2,0,1,3,4,5,6)
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wabcj, op=MPI.SUM)
+
+    return Wabcj
+
+def Wovoo(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
     FFov = cc_Fov(cc,t1,t2,eris)
+    if fint is None:
+        Wkbij = np.zeros((nkpts,nkpts,nkpts,nocc,nvir,nocc,nocc),dtype=t2.dtype)
+        WW1ovov = W1ovov(cc,t1,t2,eris)
+        WWoooo = Woooo(cc,t1,t2,eris)
+        #WW1ovvo = W1ovvo(cc,t1,t2,eris)
+        WW1voov = W1voov(cc,t1,t2,eris)
+    else:
+        Wkbij = fint['Wovoo']
+        WW1ovov = fint['W1ovov']
+        WWoooo  = fint['Woooo']
+        #WW1ovvo = fint['W1ovvo']
+        WW1voov = fint['W1voov']
 
-    Wkbij = np.empty((nkpts,nkpts,nkpts,nocc,nvir,nocc,nocc),dtype=t1.dtype)
-    for kk in range(nkpts):
-        for kb in range(nkpts):
-            for ki in range(nkpts):
-                kj = kconserv[kk,ki,kb]
-                # ovoo[kk,kb,ki,kj] <= oovo[kj,ki,kb,kk].transpose(3,2,1,0).conj()
-                Wkbij[kk,kb,ki] = np.array(eris.oovo[kj,ki,kb]).transpose(3,2,1,0).conj()
-                Wkbij[kk,kb,ki] += einsum('kbid,jd->kbij',WW1ovov[kk,kb,ki], t1[kj])
-                Wkbij[kk,kb,ki] += einsum('klij,lb->kbij',WWoooo[kk,kb,ki],-t1[kb])
-                Wkbij[kk,kb,ki] += einsum('kbcj,ic->kbij',WW1ovvo[kk,kb,ki],t1[ki])
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    print BLKSIZE
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END ################
+    ovoo_tmp_size = BLKSIZE + (nocc,nvir,nocc,nocc)
+    ovoo_tmp = np.empty(ovoo_tmp_size,dtype=t2.dtype)
 
-                for kd in range(nkpts):
-                    # kk + kl - ki - kd = 0
-                    # => kl = ki - kk + kd
-                    kl = kconserv[ki,kk,kd]
-                    St2 = 2.*t2[kl,kj,kd] - t2[kj,kl,kd].transpose(1,0,2,3)
-                    Wkbij[kk,kb,ki] += einsum('klid,ljdb->kbij',  eris.ooov[kk,kl,ki], St2)
-                    Wkbij[kk,kb,ki] += einsum('lkid,ljdb->kbij', -eris.ooov[kl,kk,ki],t2[kl,kj,kd])
-                    kl = kconserv[kb,ki,kd]
-                    Wkbij[kk,kb,ki] += einsum('lkjd,libd->kbij', -eris.ooov[kl,kk,kj],t2[kl,ki,kb])
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
 
-                    # kb + kk - kd = kc
-                    kc = kconserv[kb,kd,kk]
-                    Wkbij[kk,kb,ki] += einsum('bkdc,jidc->kbij',eris.vovv[kb,kk,kd],t2[kj,ki,kd])
-                Wkbij[kk,kb,ki] += einsum('bkdc,jd,ic->kbij',eris.vovv[kb,kk,kj],t1[kj],t1[ki])
-                Wkbij[kk,kb,ki] += einsum('kc,ijcb->kbij',FFov[kk],t2[ki,kj,kk])
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        WW1ovov_kbi = _cp(WW1ovov[s0,s1,s2])
+        WWoooo_kbi  = _cp(WWoooo[s0,s1,s2])
+        #WW1ovvo_kbi = _cp(WW1ovvo[s0,s1,s2])
+        WW1voov_bkX = _cp(WW1voov[s1,s0,:])
+
+        eris_vovv_bkX = _cp(eris.vovv[s1,s0,:])
+        eris_ooov_XkX = _cp(eris.ooov[:,s0,:])
+        eris_ooov_kXi = _cp(eris.ooov[s0,:,s1])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterkb,kb in enumerate(ranges1):
+                for iterki,ki in enumerate(ranges2):
+                    kj = kconserv[kk,ki,kb]
+
+                    ovoo_tmp[iterkk,iterkb,iterki] = np.array(eris.ovoo[kk,kb,ki],copy=True)
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('kbid,jd->kbij',WW1ovov_kbi[iterkk,iterkb,iterki], t1[kj])
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('klij,lb->kbij', WWoooo_kbi[iterkk,iterkb,iterki],-t1[kb])
+                    #ovoo_tmp[iterkk,iterkb,iterki] += einsum('kbcj,ic->kbij',WW1ovvo_kbi[iterkk,iterkb,iterki],t1[ki])
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('bkjc,ic->kbij',WW1voov_bkX[iterkb,iterkk,kj],t1[ki])
+
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('lkid,jlbd->kbij', -eris_ooov_XkX[:,iterkk,ki].reshape(nkpts*nocc,nocc,nocc,nvir),
+                                                                  t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('lkjd,libd->kbij', -eris_ooov_XkX[:,iterkk,kj].reshape(nkpts*nocc,nocc,nocc,nvir),
+                                                                  t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir))
+
+                    St2 = 2.*t2[kj,:,kb] - t2[:,kj,kb].transpose(0,2,1,3,4)
+                    St2 = St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir)
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('klid,jlbd->kbij', eris_ooov_kXi[iterkk,:,iterki].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nocc,nvir), St2)
+
+                    tau1 = t2[kj,ki,:].copy()
+                    tau1[kj] += einsum('jd,ic->jidc',t1[kj],t1[ki])
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('bkdc,jidc->kbij', eris_vovv_bkX[iterkb,iterkk,:].transpose(1,2,0,3,4).reshape(nvir,nocc,nvir*nkpts,nvir),
+                                                                tau1.transpose(1,2,0,3,4).reshape(nocc,nocc,nkpts*nvir,nvir))
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('kc,ijcb->kbij', FFov[kk],t2[ki,kj,kk])
+
+        Wkbij[s0,s1,s2] = ovoo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkbij, op=MPI.SUM)
+
     return Wkbij
+
+def W1voov(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir),dtype=t1.dtype)
+    else:
+        Wkaci  = fint['W1voov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    ovvo_tmp_size = BLKSIZE + (nocc,nvir,nvir,nocc)
+    ovvo_tmp = np.empty(ovvo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        eris_ovvo_kac = _cp(eris.ovvo[s0,s1,s2])
+        eris_oovv_kXc = _cp(eris.oovv[s0,:,s2])
+        eris_oovv_Xkc = _cp(eris.oovv[:,s0,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterka,ka in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    ki = kconserv[kk,kc,ka]
+                    ovvo_tmp[iterkk,iterka,iterkc] = _cp(eris_ovvo_kac[iterkk,iterka,iterkc])
+                    St2 = 2.*t2[ki,:,ka] - t2[:,ki,ka].transpose(0,2,1,3,4)
+                    ovvo_tmp[iterkk,iterka,iterkc] += einsum('klcd,ilad->kaci',eris_oovv_kXc[iterkk,:,iterkc].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir),
+                                                                St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    ovvo_tmp[iterkk,iterka,iterkc] += -einsum('lkcd,ilad->kaci',eris_oovv_Xkc[:,iterkk,iterkc].reshape(nocc*nkpts,nocc,nvir,nvir),
+                                                                t2[ki,:,ka].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+
+                    Wkaci[ka,kk,ki] = ovvo_tmp[iterkk,iterka,iterkc].transpose(1,0,3,2)
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
+    return Wkaci
+
+def W2voov(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir),dtype=t1.dtype)
+        WWooov = Wooov(cc,t1,t2,eris)
+    else:
+        Wkaci  = fint['W2voov']
+        WWooov = fint['Wooov']
+
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+    ovvo_tmp_size = BLKSIZE + (nocc,nvir,nvir,nocc)
+    ovvo_tmp = np.empty(ovvo_tmp_size,dtype=t2.dtype)
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+        Wooov_akX     = _cp(WWooov[s1,s0])
+        eris_ovvv_kac = _cp(eris.ovvv[s0,s1,s2])
+
+        for iterkk,kk in enumerate(ranges0):
+            for iterka,ka in enumerate(ranges1):
+                for iterkc,kc in enumerate(ranges2):
+                    ki = kconserv[kk,kc,ka]
+                    ovvo_tmp[iterkk,iterka,iterkc] = einsum('la,lkic->kaci',-t1[ka],Wooov_akX[iterka,iterkk,ki])
+                    ovvo_tmp[iterkk,iterka,iterkc] += einsum('akdc,id->kaci',eris_ovvv_kac[iterkk,iterka,iterkc].transpose(1,0,3,2),t1[ki])
+
+                    Wkaci[ka,kk,ki] = ovvo_tmp[iterkk,iterka,iterkc].transpose(1,0,3,2)
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
+    return Wkaci
+
+
+def Wvoov(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir),dtype=t1.dtype)
+        W1kaci = W1voov(cc,t1,t2,eris,fint)
+        W2kaci = W2voov(cc,t1,t2,eris,fint)
+    else:
+        Wkaci = fint['Wvoov']
+        W1kaci = fint['W1voov']
+        W2kaci = fint['W2voov']
+
+# TODO can do much better than this... call recursive function
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        Wkaci[s0,s1,s2] = _cp(W1kaci[s0,s1,s2]) + _cp(W2kaci[s0,s1,s2])
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
+    return Wkaci
+
+def WvoovR1(cc,t1,t2,eris,fint=None):
+    nkpts, nocc, nvir = t1.shape
+    kconserv = cc.kconserv
+
+    if fint is None:
+        Wkaci  = np.zeros((nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir),dtype=t1.dtype)
+        W1kaci = W1voov(cc,t1,t2,eris,fint)
+        W2kaci = W2voov(cc,t1,t2,eris,fint)
+    else:
+        Wkaci = fint['WvoovR1']
+        W1kaci = fint['W1voov']
+        W2kaci = fint['W2voov']
+
+# TODO can do much better than this... call recursive function
+    ############## Adaptive Blocking :: BEGIN ##############
+    mem = 0.5e9
+    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
+    nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
+    loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+    ############## Adaptive Blocking :: END   ##############
+
+    good2go = True
+    while(good2go):
+        good2go, data = loader.slave_set()
+        if good2go is False:
+            break
+        ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+
+        s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+        Wkaci[s2,s0,s1] = (_cp(W1kaci[s0,s1,s2]) + _cp(W2kaci[s0,s1,s2])).transpose(2,0,1,3,4,5,6)
+
+        loader.slave_finished()
+
+    cc.comm.Barrier()
+
+    if fint is None:
+        cc.comm.Allreduce(MPI.IN_PLACE, Wkaci, op=MPI.SUM)
+
+    return Wkaci

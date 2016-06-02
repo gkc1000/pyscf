@@ -106,8 +106,26 @@ def kernel(cc, eris, t1=None, t2=None, max_cycle=50, tol=1e-8, tolnormt=1e-6,
         t1new, t2new = cc.update_amps(t1, t2, eris, max_memory)
 
         print "calculating norm..."
+        mem = 0.5e9
+        pre = 1.*nocc*nocc*nvir*nvir*16
+        nkpts_blksize  = max(int(numpy.floor(mem/pre)),1)
+        nkpts_blksize1 = max(int(numpy.floor(mem/(pre*nkpts_blksize))),1)
+        nkpts_blksize2 = max(int(numpy.floor(mem/(pre*nkpts_blksize*nkpts_blksize1))),1)
+        loader = mpi_load_balancer.load_balancer(BLKSIZE=(nkpts_blksize2,nkpts_blksize1,nkpts_blksize,))
+        loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
+
+        good2go = True
         normt = numpy.array(0.0,dtype=numpy.float64)
-        normt += numpy.linalg.norm(t1new-t1) + numpy.linalg.norm(t2new-t2)
+        while(good2go):
+            good2go, data = loader.slave_set()
+            if good2go is False:
+                break
+            ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
+            s0,s1,s2 = [slice(min(x),max(x)+1) for x in ranges0,ranges1,ranges2]
+
+            normt += numpy.linalg.norm(t1new[s0]-t1[s0])
+            normt += numpy.linalg.norm(t2new[s0,s1,s2]-t2[s0,s1,s2])
+            loader.slave_finished()
         comm.Allreduce(MPI.IN_PLACE, normt, op=MPI.SUM)
 
         print "setting old t1,t2 to t1,t2new"
@@ -126,17 +144,18 @@ def kernel(cc, eris, t1=None, t2=None, max_cycle=50, tol=1e-8, tolnormt=1e-6,
         _tmpfile3_name = None
         if cc.rank == 0:
             _tmpfile3_name = "t_amplitudes.hdf5"
-        _tmpfile3_name = cc.comm.bcast(_tmpfile3_name, root=0)
-        feri4 = h5py.File(_tmpfile3_name, 'w', driver='mpio', comm=MPI.COMM_WORLD)
-        ds_type = t2.dtype
-        out_t1  = feri4.create_dataset('t1', (nkpts,nocc,nvir), dtype=ds_type)
-        out_t2  = feri4.create_dataset('t2', (nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=ds_type)
-        for ki in range(nkpts):
-            out_t1[ki] = t1[ki].copy()
-            for kj in range(nkpts):
-                for ka in range(nkpts):
-                    out_t2[ki,kj,ka] = t2[ki,kj,ka].copy()
-        feri4.close()
+            #_tmpfile3_name = cc.comm.bcast(_tmpfile3_name, root=0)
+            feri4 = h5py.File(_tmpfile3_name, 'w')#, driver='mpio', comm=MPI.COMM_WORLD)
+            ds_type = t2.dtype
+            out_t1  = feri4.create_dataset('t1', (nkpts,nocc,nvir), dtype=ds_type)
+            out_t2  = feri4.create_dataset('t2', (nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=ds_type)
+            for ki in range(nkpts):
+                out_t1[ki] = t1[ki].copy()
+                for kj in range(nkpts):
+                    for ka in range(nkpts):
+                        out_t2[ki,kj,ka] = t2[ki,kj,ka].copy()
+            feri4.close()
+        cc.comm.Barrier()
         #################################
 
         eold, eccsd = eccsd, energy(cc, t1, t2, eris)
@@ -504,7 +523,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(numpy.floor(mem/pre)),1),nkpts)
     BLKSIZE = (nkpts_blksize,nkpts,1,)
-    loader = mpi_load_balancer.load_balancer(BLKSIZE=(nkpts_blksize,nkpts,1,))
+    loader = mpi_load_balancer.load_balancer(BLKSIZE=(1,nkpts,nkpts_blksize,))
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 ####
 
@@ -514,7 +533,6 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
         if good2go is False:
             break
         ranges0, ranges1, ranges2 = loader.get_blocks_from_data(data)
-        ranges0, ranges1, ranges2 = _cp(ranges0), _cp(ranges1), _cp(ranges2)
         if min(ranges0) > max(ranges1): #continue if ki > kj
             loader.slave_finished()
             continue
@@ -1417,15 +1435,14 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             ranges0 = loader.get_blocks_from_data(data)
 
             s0 = slice(min(ranges0),max(ranges0)+1)
-            s1 = slice(kshift,kshift+1)
 
-            Wvovv_slX = _cp(imds.Wvovv[s1,s0,:])
+            Wvovv_slX = _cp(imds.Wvovv[kshift,s0,:])
 
             for iterkl,kl in enumerate(ranges0):
                 Hr1 += 2.*einsum('ld,lad->a',imds.Fov[kl],r2[kl,kshift])
                 Hr1 +=   -einsum('ld,lda->a',imds.Fov[kl],r2[kl,kl])
                 kd_list = numpy.array(kconserv[kshift,range(nkpts),kl])
-                Hr1 += einsum('alxcd,lxcd->a',2.*Wvovv_slX[kshift,iterkl,:].transpose(1,2,0,3,4)-Wvovv_slX[kshift,iterkl,kd_list].transpose(1,2,0,4,3),
+                Hr1 += einsum('alxcd,lxcd->a',2.*Wvovv_slX[iterkl,:].transpose(1,2,0,3,4)-Wvovv_slX[iterkl,kd_list].transpose(1,2,0,4,3),
                                r2[kl,:].transpose(1,0,2,3))
                 #for kc in range(nkpts):
                 #    kd = kconserv[kshift,kc,kl]
@@ -1506,25 +1523,26 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                     kb = kconserv[kshift,ka,kj]
                     Hr2[kj,ka] += -einsum('k,kjab->jab',tmp,t2[kshift,kj,ka])
 
-            #Wovov_Xbj = _cp(imds.Wovov[:,s1,s0])
             #Wvoov_bXj = _cp(imds.Wvoov[s1,:,s0])
             WovovRev_Xbj = _cp(imds.WovovRev[s0,s1,:])
+#
+            #Wovov_Xbj = _cp(imds.Wovov[:,s1,s0])
             WvoovR1_bXj = _cp(imds.WvoovR1[s0,s1,:])
             # shift + kj - kb = ka
             for iterkj,kj in enumerate(ranges0):
                 for iterkb,kb in enumerate(ranges1):
                     ka = kconserv[kshift,kb,kj]
-                    Hr2[kj,ka] += -einsum('bldj,lad->jab',WovovRev_Xbj[iterkj,iterkb,:].transpose(2,0,1,4,3).reshape(nvir,nkpts*nocc,nvir,nocc),
-                                          r2[:,ka].reshape(nkpts*nocc,nvir,nvir))
                     #Hr2[kj,ka] += -einsum('bldj,lad->jab',Wovov_Xbj[:,iterkb,iterkj].transpose(2,0,1,4,3).reshape(nvir,nkpts*nocc,nvir,nocc),
                     #                      r2[:,ka].reshape(nkpts*nocc,nvir,nvir))
+                    Hr2[kj,ka] += -einsum('bldj,lad->jab',WovovRev_Xbj[iterkj,iterkb,:].transpose(2,0,1,4,3).reshape(nvir,nkpts*nocc,nvir,nocc),
+                                          r2[:,ka].reshape(nkpts*nocc,nvir,nvir))
                     kl_range = _cp(range(nkpts))
                     kd_range = _cp(kconserv[kb,kj,kl_range])
                     kl_slice = slice(0,nkpts)
                     #Hr2[kj,ka] += einsum('bljd,lad->jab',Wvoov_bXj[iterkb,:,iterkj].transpose(1,0,2,3,4).reshape(nvir,nocc*nkpts,nocc,nvir),
                     #                        (2.*r2[:,ka]-r2[kl_range,kd_range].transpose(0,1,3,2)).reshape(nocc*nkpts,nvir,nvir))
                     Hr2[kj,ka] += einsum('bljd,lad->jab',WvoovR1_bXj[iterkj,iterkb,:].transpose(1,0,2,3,4).reshape(nvir,nocc*nkpts,nocc,nvir),
-                                            (2.*r2[:,ka]-r2[kl_slice,kd_range].transpose(0,1,3,2)).reshape(nocc*nkpts,nvir,nvir))
+                                            (2.*r2[:,ka]-r2[kl_range,kd_range].transpose(0,1,3,2)).reshape(nocc*nkpts,nvir,nvir))
 
             Wvvvv_abX = _cp(imds.Wvvvv[s0,s1])
             # kj = ka - kshift + kb
@@ -1711,7 +1729,7 @@ class _ERIS:
                             new_oovv[kp,kq,kr] = self.oovv[kp,kq,kr].copy()
                 self.oovv = new_oovv
 
-                print "lower triangular oovv"
+                #print "lower triangular oovv"
                 #self.triu_oovv = numpy.empty( ((nkpts*(nkpts+1))/2,nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff.dtype)
                 #triu_indices = [list(x) for x in numpy.triu_indices(nkpts)]
                 #self.triu_oovv = self.oovv[triu_indices]
@@ -1974,7 +1992,7 @@ class _IMDS:
             self.fint1 = None
 
         print "*** Using HDF5 ERI storage ***"
-        tmpfile1_name = "eom_intermediates.hdf5"
+        tmpfile1_name = "eom_intermediates_IP.hdf5"
         self.fint1 = h5py.File(tmpfile1_name, 'w', driver='mpio', comm=MPI.COMM_WORLD)
 
         ds_type = t2.dtype
@@ -2046,25 +2064,30 @@ class _IMDS:
             self.fint1 = None
 
         print "*** Using HDF5 ERI storage ***"
-        tmpfile1_name = "eom_intermediates.hdf5"
+        tmpfile1_name = "eom_intermediates_EA.hdf5"
         self.fint1 = h5py.File(tmpfile1_name, 'w', driver='mpio', comm=MPI.COMM_WORLD)
 
         ds_type = t2.dtype
 
         self.Wooov  = self.fint1.create_dataset('Wooov',  (nkpts,nkpts,nkpts,nocc,nocc,nocc,nvir), dtype=ds_type)
         self.Wvovv  = self.fint1.create_dataset('Wvovv',  (nkpts,nkpts,nkpts,nvir,nocc,nvir,nvir), dtype=ds_type)
+
         #self.W1ovvo = self.fint1.create_dataset('W1ovvo', (nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc), dtype=ds_type)
         #self.W2ovvo = self.fint1.create_dataset('W2ovvo', (nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc), dtype=ds_type)
         #self.Wovvo  = self.fint1.create_dataset('Wovvo',  (nkpts,nkpts,nkpts,nocc,nvir,nvir,nocc), dtype=ds_type)
+
         self.W1voov = self.fint1.create_dataset('W1voov', (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
         self.W2voov = self.fint1.create_dataset('W2voov', (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
+#
         #self.Wvoov  = self.fint1.create_dataset('Wvoov',  (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
         self.WvoovR1 = self.fint1.create_dataset('WvoovR1',  (nkpts,nkpts,nkpts,nvir,nocc,nocc,nvir), dtype=ds_type)
         self.Wvvvv  = self.fint1.create_dataset('Wvvvv',  (nkpts,nkpts,nkpts,nvir,nvir,nvir,nvir), dtype=ds_type)
         self.W1ovov = self.fint1.create_dataset('W1ovov',  (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
         self.W2ovov = self.fint1.create_dataset('W2ovov',  (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
+#
         #self.Wovov  = self.fint1.create_dataset('Wovov',   (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
         self.WovovRev  = self.fint1.create_dataset('WovovRev',   (nkpts,nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=ds_type)
+#
         #self.Wvvvo  = self.fint1.create_dataset('Wvvvo',  (nkpts,nkpts,nkpts,nvir,nvir,nvir,nocc), dtype=ds_type)
         self.WvvvoR1  = self.fint1.create_dataset('WvvvoR1',  (nkpts,nkpts,nkpts,nvir,nvir,nvir,nocc), dtype=ds_type)
 
@@ -2080,6 +2103,7 @@ class _IMDS:
 
         self.W1voov = imdk.W1voov(cc,t1,t2,eris,self.fint1)
         self.W2voov = imdk.W2voov(cc,t1,t2,eris,self.fint1)
+#
         #self.Wvoov = imdk.Wvoov(cc,t1,t2,eris,self.fint1)
         self.WvoovR1 = imdk.WvoovR1(cc,t1,t2,eris,self.fint1)
 
@@ -2093,9 +2117,11 @@ class _IMDS:
 
         self.W1ovov = imdk.W1ovov(cc,t1,t2,eris,self.fint1)
         self.W2ovov = imdk.W2ovov(cc,t1,t2,eris,self.fint1)
+#
         #self.Wovov  = imdk.Wovov(cc,t1,t2,eris,self.fint1)
         self.WovovRev  = imdk.WovovRev(cc,t1,t2,eris,self.fint1)
 
+#
         #self.Wvvvo = imdk.Wvvvo(cc,t1,t2,eris,self.fint1)
         self.WvvvoR1 = imdk.WvvvoR1(cc,t1,t2,eris,self.fint1)
 
@@ -2109,13 +2135,16 @@ class _IMDS:
         #self.Wovvo  = self.fint1['Wovvo' ]
         self.W1voov = self.fint1['W1voov']
         self.W2voov = self.fint1['W2voov']
+#
         #self.Wvoov  = self.fint1['Wvoov' ]
         self.WvoovR1  = self.fint1['WvoovR1' ]
         self.Wvvvv  = self.fint1['Wvvvv' ]
         self.W1ovov = self.fint1['W1ovov']
         self.W2ovov = self.fint1['W2ovov']
+#
         #self.Wovov  = self.fint1['Wovov' ]
         self.WovovRev  = self.fint1['WovovRev' ]
+#
         #self.Wvvvo  = self.fint1['Wvvvo' ]
         self.WvvvoR1  = self.fint1['WvvvoR1' ]
 

@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.linalg
+from mpi4py import MPI
 
 '''
 Extension to scipy.linalg module developed for PBC branch.
@@ -8,9 +9,9 @@ Extension to scipy.linalg module developed for PBC branch.
 method = 'arnoldi'
 #method = 'davidson'
 
-VERBOSE = False 
+VERBOSE = True
 
-def eigs(matvec,size,nroots,Adiag=None):
+def eigs(matvec,size,nroots,tol=1e-8,Adiag=None):
     '''Davidson diagonalization method to solve A c = E c
     when A is not Hermitian.
     '''
@@ -25,8 +26,10 @@ def eigs(matvec,size,nroots,Adiag=None):
         # Currently not used:
         x = np.ones((size,1))
         P = np.ones((size,1))
-        arnold = Arnoldi(matvec_args, x, P, nroots=nroots)
+        arnold = Arnoldi(matvec_args, x, P, nroots=nroots, tol=tol)
         return arnold.solve()
+        #e,c,m = davidson(matvec,size,nroots,Adiag=Adiag)
+        #return e,c
     else:
         david = Davidson()
         david.ndim = size
@@ -36,15 +39,119 @@ def eigs(matvec,size,nroots,Adiag=None):
 
         return david.solve_iter()
 
+def davidson(mult_by_A,N,neig,Adiag=None):
+    """Diagonalize a matrix via non-symmetric Davidson algorithm.
+    mult_by_A() is a function which takes a vector of length N
+        and returns a vector of length N.
+    neig is the number of eigenvalues requested
+    """
+    Mmin = min(neig,N)
+    Mmax = min(N,200)
+    tol = 1e-6
+
+    #Adiagcheck = np.zeros(N,np.complex)
+    #for i in range(N):
+    #    test = np.zeros(N,np.complex)
+    #    test[i] = 1.0
+    #    Adiagcheck[i] = mult_by_A(test)[i]
+    #print "Analytical Adiag == numerical Adiag?", np.allclose(Adiag,Adiagcheck)
+
+    if Adiag is None:
+        Adiag = np.zeros(N,np.complex)
+        Adiag = mult_by_A(np.ones(N))
+        #for i in range(N):
+        #    test = np.zeros(N,np.complex)
+        #    test[i] = 1.0
+        #    Adiag[i] = mult_by_A(test)[i]
+
+    xi = np.zeros(N,np.complex)
+
+    target = 0
+    for M in range(Mmin,Mmax+1):
+        if M == Mmin:
+            # Set of M unit vectors from lowest Adiag (NxM)
+            b = np.zeros((N,M))
+            idx = Adiag.argsort()
+            for m,i in zip(range(M),idx):
+                b[i,m] = 1.0
+            ## Add random noise and orthogonalize
+            #for m in range(M):
+            #    b[:,m] += 0.01*np.random.random(N)
+            #    b[:,m] /= np.linalg.norm(b[:,m])
+            #    b,R = np.linalg.qr(b)
+
+            Ab = np.zeros((N,M),np.complex)
+            for m in range(M):
+                Ab[:,m] = mult_by_A(b[:,m])
+        else:
+            Ab = np.column_stack( (Ab,mult_by_A(b[:,M-1])) )
+
+        Atilde = np.dot(b.conj().transpose(),Ab)
+        lamda, alpha = diagonalize_asymm(Atilde)
+        lamda_k = lamda[target]
+        alpha_k = alpha[:,target]
+
+        if M == Mmax:
+            break
+
+        q = np.dot( Ab-lamda_k*b, alpha_k )
+        if np.linalg.norm(q) < tol:
+            if target == neig-1:
+                break
+            else:
+                target += 1
+        for i in range(N):
+            eps = 0.
+            if np.allclose(lamda_k,Adiag[i]):
+                eps = 1e-8
+            xi[i] = q[i]/(lamda_k-Adiag[i]+eps)
+
+        print "** Iteration, ", M, "eval guess =", lamda_k
+
+        # orthonormalize xi wrt b
+        bxi,R = np.linalg.qr(np.column_stack((b,xi)))
+        # append orthonormalized xi to b
+        b = np.column_stack((b,bxi[:,-1]))
+
+    if M > Mmin and M == Mmax:
+        print("WARNING: Davidson algorithm reached max basis size "
+              "M = %d without converging."%(M))
+
+    # Express alpha in original basis
+    evecs = np.dot(b,alpha) # b is N x M, alpha is M x M
+    return lamda[:neig], evecs[:,:neig], M
+
+
+def diagonalize_asymm(H):
+    """
+    Diagonalize a real, *asymmetric* matrix and return sorted results.
+
+    Return the eigenvalues and eigenvectors (column matrix)
+    sorted from lowest to highest eigenvalue.
+    """
+    E,C = np.linalg.eig(H)
+    #if np.allclose(E.imag, 0*E.imag):
+    #    E = np.real(E)
+    #else:
+    #    print "WARNING: Eigenvalues are complex, will be returned as such."
+
+    idx = E.real.argsort()
+    E = E[idx]
+    C = C[:,idx]
+
+    return E,C
 
 class Arnoldi(object):
-    def __init__(self,matr_multiply,xStart,inPreCon,nroots=1,tol=1e-10):
+    def __init__(self,matr_multiply,xStart,inPreCon,nroots=1,tol=1e-8):
         self.matrMultiply = matr_multiply
         self.size = xStart.shape[0]
         self.nEigen = min(nroots, self.size)
-        self.maxM = min(30, self.size)
+        self.maxM = min(100, self.size)
         self.maxOuterLoop = 10
         self.tol = tol
+
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
 
         #
         #  Creating initial guess and preconditioner
@@ -88,7 +195,8 @@ class Arnoldi(object):
                 self.totalIter += 1
                 self.currentSize += 1
         if VERBOSE:
-            print "\nConverged in %3d cycles" % self.totalIter
+            if self.rank == 0:
+                print "\nConverged in %3d cycles" % self.totalIter
         self.constructAllSolV()
         return self.outeigs, self.outevecs
 
@@ -123,9 +231,9 @@ class Arnoldi(object):
         self.currentSize = self.nEigen
         for i in xrange(self.currentSize):
             self.vlist[i] *= 0.0
-            self.vlist[i,:] += np.random.rand(self.size)
-            self.vlist[i,i] /= np.linalg.norm(self.vlist[i,i])
-            self.vlist[i,i] *= 12.
+            self.vlist[i,i] += 1. #np.random.rand(self.size)
+            #self.vlist[i,i] /= np.linalg.norm(self.vlist[i,i])
+            #self.vlist[i,i] *= 12.
             for j in xrange(i):
                 fac = np.vdot( self.vlist[j,:], self.vlist[i,:] )
                 self.vlist[i,:] -= fac * self.vlist[j,:]
@@ -134,6 +242,7 @@ class Arnoldi(object):
             self.cv = self.vlist[i].copy()
             self.hMult()
             self.Avlist[i] = self.cAv.copy()
+
         self.constructSubspace()
 
     def hMult(self):
@@ -219,8 +328,8 @@ class Arnoldi(object):
             if orthog > 1e-8:
                 sys.exit( "Exiting davidson procedure ... orthog = %24.16f" % orthog )
         orthog = orthog ** 0.5
-        if not self.deflated:
-            if VERBOSE:
+        if VERBOSE:
+            if self.rank == 0:
                 print "%3d %20.14f %20.14f  %10.4g" % (self.ciEig, self.cvEig.real, self.resnorm.real, orthog.real)
         #else:
         #    print "%3d %20.14f %20.14f %20.14f (deflated)" % (self.ciEig, self.cvEig,
@@ -235,15 +344,17 @@ class Arnoldi(object):
     def checkConvergence(self):
         if self.resnorm < self.tol:
             if VERBOSE:
-                print "Eigenvalue %3d converged! (res = %.15g)" % (self.ciEig, self.resnorm)
+                if self.rank == 0:
+                    print "Eigenvalue %3d converged! (res = %.15g)" % (self.ciEig, self.resnorm)
             self.ciEig += 1
         if self.ciEig == self.nEigen:
             self.converged = True
         if self.resnorm < self.tol and not self.converged:
             if VERBOSE:
-                print ""
-                print ""
-                print "%-3s %-20s %-20s %-8s" % ("#", "  Eigenvalue", "  Res. Norm.", "  Ortho. (should be ~0)")
+                if self.rank == 0:
+                    print ""
+                    print ""
+                    print "%-3s %-20s %-20s %-8s" % ("#", "  Eigenvalue", "  Res. Norm.", "  Ortho. (should be ~0)")
 
     def gramSchmidtCurrentVec(self,northo):
         for k in xrange(northo):

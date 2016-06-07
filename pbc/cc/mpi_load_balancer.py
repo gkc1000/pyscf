@@ -27,7 +27,9 @@ class load_balancer:
         if BLKSIZE == None:
             BLKSIZE = self.BLKSIZE
         if len(BLKSIZE) != len(inindices):
-##            print "BLKSIZE AND ININDICES MUST HAVE SAME SHAPE!!!!"
+            print "BLKSIZE AND ININDICES MUST HAVE SAME SHAPE!!!!"
+            print "rank, BLKSIZE, inindices"
+            print self.rank, BLKSIZE, inindices
             sys.exit()
         self.nindices = len(inindices)
         ##print "nindices = ", self.nindices

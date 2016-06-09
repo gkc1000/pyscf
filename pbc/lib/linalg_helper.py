@@ -1,6 +1,8 @@
+import os.path
 import numpy as np
 import scipy.linalg
 from mpi4py import MPI
+import h5py
 
 '''
 Extension to scipy.linalg module developed for PBC branch.
@@ -11,7 +13,7 @@ method = 'arnoldi'
 
 VERBOSE = True
 
-def eigs(matvec,size,nroots,tol=1e-8,Adiag=None):
+def eigs(matvec,size,nroots,tol=1e-6,Adiag=None,targetFn=None,filename=None):
     '''Davidson diagonalization method to solve A c = E c
     when A is not Hermitian.
     '''
@@ -25,8 +27,9 @@ def eigs(matvec,size,nroots,tol=1e-8,Adiag=None):
     if method == 'arnoldi':
         # Currently not used:
         x = np.ones((size,1))
-        P = np.ones((size,1))
-        arnold = Arnoldi(matvec_args, x, P, nroots=nroots, tol=tol)
+        if Adiag is None:
+            Adiag = np.ones((size,1))
+        arnold = Arnoldi(matvec_args, x, inPreCon=Adiag, nroots=nroots, tol=tol, targetFn=targetFn, filename=filename)
         return arnold.solve()
         #e,c,m = davidson(matvec,size,nroots,Adiag=Adiag)
         #return e,c
@@ -142,14 +145,22 @@ def diagonalize_asymm(H):
     return E,C
 
 class Arnoldi(object):
-    def __init__(self,matr_multiply,xStart,inPreCon,nroots=1,tol=1e-8):
+    def __init__(self,matr_multiply,xStart,inPreCon=None,nroots=1,tol=1e-6,targetFn=None,filename=None):
         self.matrMultiply = matr_multiply
         self.size = xStart.shape[0]
         self.nEigen = min(nroots, self.size)
-        self.maxM = min(100, self.size)
+        self.maxM = min(300, self.size)
         self.maxOuterLoop = 10
         self.tol = tol
+	self.targetFn=targetFn
+        if self.targetFn is not None:
+            # for no arguments, the targetFn should return the maximum number of roots to find
+            self.nEigen = min(self.nEigen,self.targetFn())
 
+	self.filename=filename
+
+        self.writeout = 10
+        self.nconverged = 0
         self.comm = MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
 
@@ -161,7 +172,7 @@ class Arnoldi(object):
         self.iteration = 0
         self.totalIter = 0
         self.converged = False
-        self.preCon = inPreCon.copy()
+        self.preCon = inPreCon
         #
         #  Allocating other vectors
         #
@@ -234,10 +245,30 @@ class Arnoldi(object):
             self.vlist[i,i] += 1. #np.random.rand(self.size)
             #self.vlist[i,i] /= np.linalg.norm(self.vlist[i,i])
             #self.vlist[i,i] *= 12.
+            #for j in xrange(i):
+            #    fac = np.vdot( self.vlist[j,:], self.vlist[i,:] )
+            #    self.vlist[i,:] -= fac * self.vlist[j,:]
+            #self.vlist[i,:] /= np.linalg.norm(self.vlist[i,:])
+
+    	#################################
+    	# Reading amplitudes from file  #
+    	#################################
+        if self.filename is not None and self.totalIter == 0:
+    	    if os.path.isfile(self.filename):
+    	        feri4 = h5py.File(self.filename, 'r', driver='mpio', comm=MPI.COMM_WORLD)
+    	        in_vec = feri4['vec']
+                if in_vec.shape == (self.nEigen,self.size):
+    	            print "reading davidson guess from file..."
+                    self.vlist[:self.nEigen,:] = in_vec.value
+    	        feri4.close()
+    	#################################
+
+        for i in xrange(self.currentSize):
             for j in xrange(i):
                 fac = np.vdot( self.vlist[j,:], self.vlist[i,:] )
                 self.vlist[i,:] -= fac * self.vlist[j,:]
             self.vlist[i,:] /= np.linalg.norm(self.vlist[i,:])
+
         for i in xrange(self.currentSize):
             self.cv = self.vlist[i].copy()
             self.hMult()
@@ -268,10 +299,21 @@ class Arnoldi(object):
                     self.subH[self.currentSize-1,j] = val
 
     def solveSubspace(self):
-        w, v = scipy.linalg.eig(self.subH[:self.currentSize,:self.currentSize])
+        #w, v = scipy.linalg.eig(self.subH[:self.currentSize,:self.currentSize])
+        w, v = np.linalg.eig(self.subH[:self.currentSize,:self.currentSize])
         idx = w.real.argsort()
         v = v[:,idx]
         w = w[idx].real
+
+        # WARNING : small numerical errors sometimes build up if we don't broadcast
+        #   the following.  Because of this, we can have, for example, eigenvalue 
+        #   2 converge on processor 1 while eigenvalue 3 doesn't converge on processor
+        #   0.  So both of these two processors will be finding approximations for
+        #   different eigenvalues.
+        #
+        # TODO: make it so we don't have to bcast, maybe just make proc 0 do the solving
+	#v = self.comm.bcast(v, root=1)
+	#w = self.comm.bcast(w, root=1)
 #
         imag_norm = np.linalg.norm(w.imag)
         if imag_norm > 1e-12:
@@ -282,15 +324,36 @@ class Arnoldi(object):
         #print "Imaginary norm eigenvalue   = ", np.linalg.norm(w.imag)
         #print "eigenvalues = ", w[:min(self.currentSize,7)]
 #
-        self.sol[:self.currentSize] = v[:,self.ciEig]
         self.evecs[:self.currentSize,:self.currentSize] = v
         self.eigs[:self.currentSize] = w[:self.currentSize]
-        self.outeigs[:self.nEigen] = w[:self.nEigen]
+
+	self.target_eigenvalues = range(self.nEigen)
+        if self.targetFn is not None:
+            self.target_eigenvalues = self.targetFn(np.dot(self.vlist[:self.currentSize].transpose(),self.evecs[:self.currentSize,:self.currentSize]))
+
+        ###############################
+        # Writing amplitudes to file  #
+        ###############################
+        if self.rank == 0 and self.filename is not None and self.totalIter > 0 and (self.totalIter%self.writeout)==0:
+            self.constructAllSolV()
+            feri4 = h5py.File(self.filename, 'w')#, driver='mpio', comm=MPI.COMM_WORLD)
+            ds_type = complex
+            out_vec = feri4.create_dataset('vec', (self.nEigen,self.size), dtype=ds_type)
+            out_vec[:] = self.outevecs.T[:] 
+            feri4.close()
+        self.comm.Barrier()
+        #################################
+
+        self.outeigs[:self.nEigen] = w[self.target_eigenvalues[:self.currentSize]][:self.nEigen]
+
+        self.ciEig = self.target_eigenvalues[self.nconverged]
         self.cvEig = self.eigs[self.ciEig]
+        self.sol[:self.currentSize] = v[:,self.ciEig]
 
     def constructAllSolV(self):
         for i in range(self.nEigen):
-            self.sol[:] = self.evecs[:,i]
+            target_root = self.target_eigenvalues[i]
+            self.sol[:] = self.evecs[:,target_root]
             self.cv = np.dot(self.vlist[:self.currentSize].transpose(),self.sol[:self.currentSize])
             self.outevecs[:,i] = self.cv
 
@@ -306,6 +369,13 @@ class Arnoldi(object):
 
     def computeResidual(self):
         self.res = self.cAv - self.cvEig * self.cv
+        #
+        # Preconditioning if necessary
+        #
+        if self.preCon is not None:
+            self.res = [self.res[i] / (self.preCon[i] - self.cvEig) for i in range(len(self.res))]
+        self.res = np.array(self.res).reshape(-1)
+
         self.dres = np.vdot(self.res,self.res)**0.5
         #
         # gram-schmidt for residual vector
@@ -319,6 +389,7 @@ class Arnoldi(object):
         for i in xrange(self.currentSize):
             self.dgks[i] = np.vdot( self.vlist[i,:], self.res )
             self.res -= self.dgks[i]*self.vlist[i,:]
+
         self.resnorm = np.linalg.norm(self.res)
         self.res /= self.resnorm
 
@@ -328,9 +399,10 @@ class Arnoldi(object):
             if orthog > 1e-8:
                 sys.exit( "Exiting davidson procedure ... orthog = %24.16f" % orthog )
         orthog = orthog ** 0.5
+	self.resnorm = self.comm.bcast(self.resnorm, root=0)
         if VERBOSE:
             if self.rank == 0:
-                print "%3d %20.14f %20.14f  %10.4g" % (self.ciEig, self.cvEig.real, self.resnorm.real, orthog.real)
+            	print "%3d %20.14f %20.14f  %10.4g" % (self.nconverged, self.cvEig.real, self.resnorm.real, orthog.real)
         #else:
         #    print "%3d %20.14f %20.14f %20.14f (deflated)" % (self.ciEig, self.cvEig,
         #                                                      self.resnorm, orthog)
@@ -346,8 +418,8 @@ class Arnoldi(object):
             if VERBOSE:
                 if self.rank == 0:
                     print "Eigenvalue %3d converged! (res = %.15g)" % (self.ciEig, self.resnorm)
-            self.ciEig += 1
-        if self.ciEig == self.nEigen:
+            self.nconverged += 1
+        if self.nconverged == self.nEigen:
             self.converged = True
         if self.resnorm < self.tol and not self.converged:
             if VERBOSE:
@@ -359,7 +431,7 @@ class Arnoldi(object):
     def gramSchmidtCurrentVec(self,northo):
         for k in xrange(northo):
             fac = np.vdot( self.vlist[k,:], self.cv )
-            self.cv -= fac * self.vlist[k,:] #/ np.vdot(self.vlist[i],self.vlist[i])
+            self.cv -= fac * self.vlist[k,:] #/ np.vdot(self.vlist[k,:],self.vlist[k,:])
         cvnorm = np.linalg.norm(self.cv)
         if cvnorm < 1e-4:
             self.cv = np.random.rand(self.size)
@@ -380,15 +452,22 @@ class Arnoldi(object):
     def checkDeflate(self):
         if self.currentSize == self.maxM-1:
             self.deflated = 1
+	    #print "deflated..."
             for i in xrange(self.nEigen):
-                self.sol[:self.currentSize] = self.evecs[:self.currentSize,i]
+                target_root = self.target_eigenvalues[i]
+                self.sol[:self.currentSize] = self.evecs[:self.currentSize,target_root]
+		#print self.sol[:2]
                 self.constructSolV()            # Finds the "best" eigenvector for this eigenvalue
                 self.Avlist[i,:] = self.cv.copy() # Puts this guess in self.Avlist rather than self.vlist for now...
                                                 # since this would mess up self.constructSolV()'s solution
             for i in xrange(self.nEigen):
                 self.cv = self.Avlist[i,:].copy() # This is actually the "best" eigenvector v, not A*v (see above)
+                #print "cv = ",self.cv[:5]
                 self.gramSchmidtCurrentVec(i)
                 self.vlist[i,:] = self.cv.copy()
+                #print "vlist = ", self.vlist[i,:5]
+	        self.comm.Barrier()
+
 
             orthog = 0.0
             for j in xrange(self.nEigen):

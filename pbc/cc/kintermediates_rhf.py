@@ -7,6 +7,8 @@ import mpi_load_balancer
 from pyscf import lib
 from pyscf.pbc import lib as pbclib
 from pyscf.cc.ccsd import _cp
+from pyscf.pbc.cc_test.kpoint_helper import tril_index
+from pyscf.pbc.cc_test.kpoint_helper import unpack_tril
 
 #einsum = np.einsum
 einsum = pbclib.einsum
@@ -82,7 +84,8 @@ def cc_Foo(cc,t1,t2,eris,feri2=None):
             #Fki[ki] += einsum('lkcd,licd->ki',eris.SoOvv[kk,kc],tau1_oOvv[ki,kc])
                 kd = kconserv[kk,kc,kl]
                 Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-                Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
+#                Fki[ki] += einsum('klcd,ilcd->ki',Soovv,t2[ki,kl,kc])
+                Fki[ki] += einsum('klcd,ilcd->ki',Soovv,unpack_tril(t2,nkpts,ki,kl,kc,kconserv[ki,kc,kl]))
             #if ki == kc:
             kd = kconserv[kk,ki,kl]
             Soovv = 2*eris.oovv[kk,kl,ki] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
@@ -104,7 +107,8 @@ def cc_Fvv(cc,t1,t2,eris,feri2=None):
             for kk in range(nkpts):
                 kd = kconserv[kk,kc,kl]
                 Soovv = 2*eris.oovv[kk,kl,kc] - eris.oovv[kk,kl,kd].transpose(0,1,3,2)
-                Fac[ka] += -einsum('klcd,klad->ac',Soovv,t2[kk,kl,ka])
+#                Fac[ka] += -einsum('klcd,klad->ac',Soovv,t2[kk,kl,ka])
+                Fac[ka] += -einsum('klcd,klad->ac',Soovv,unpack_tril(t2,nkpts,kk,kl,ka,kconserv[kk,ka,kl]))
             #if kk == ka
             kd = kconserv[ka,kc,kl]
             Soovv = 2*eris.oovv[ka,kl,kc] - eris.oovv[ka,kl,kd].transpose(0,1,3,2)
@@ -296,7 +300,8 @@ def cc_Wvoov(cc,t1,t2,eris,feri2=None):
                     #
                     # Making various intermediates...
                     #
-                    t2_oOvv = t2[ki,:,ka].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
+#                    t2_oOvv = t2[ki,:,ka].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
+                    t2_oOvv = unpack_tril(t2,nkpts,ki,range(nkpts),ka,kconserv[ki,ka,range(nkpts)]).transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
                     #eris_oOvv = eris.oovv[kk,:,kc].transpose(0,2,1,3,4).reshape(nkpts*nocc,nocc,nvir,nvir)
 
                     voov_tmp[iterka,iterkk,iterki] += 0.5*einsum('lkcd,liad->akic',eris.SoOvv[kk,kc],t2_oOvv)
@@ -348,7 +353,8 @@ def cc_Wvovo(cc,t1,t2,eris,feri2=None):
                     #Wvovo[ka,kk,kc] = vovo_tmp[iterka,iterkk,iterkc]
 
                     oovvf = eris.oovv[:,kk,kc].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    t2f   = t2[:,ki,ka].copy() #This is a tau like term
+#                    t2f   = t2[:,ki,ka].copy() #This is a tau like term
+                    t2f   = unpack_tril(t2,nkpts,range(nkpts),ki,ka,kconserv[range(nkpts),ka,ki]).copy() #This is a tau like term
                     #for kl in range(nkpts):
                     #    kd = kconserv[kl,kc,kk]
                     #    if ki == kd and kl == ka:
@@ -404,7 +410,8 @@ def cc_Wovov(cc,t1,t2,eris,feri2=None):
                     #Wvovo[ka,kk,kc] = ovov_tmp[iterka,iterkk,iterkc]
 
                     oovvf = eris.oovv[:,kk,kc].reshape(nkpts*nocc,nocc,nvir,nvir)
-                    t2f   = t2[:,ki,ka].copy() #This is a tau like term
+#                    t2f   = t2[:,ki,ka].copy() #This is a tau like term
+                    t2f   = unpack_tril(t2,nkpts,range(nkpts),ki,ka,kconserv[range(nkpts),ka,ki]).copy() #This is a tau like term
                     #for kl in range(nkpts):
                     #    kd = kconserv[kl,kc,kk]
                     #    if ki == kd and kl == ka:
@@ -566,11 +573,15 @@ def W1ovvo(cc,t1,t2,eris,fint=None):
                 for iterkc,kc in enumerate(ranges2):
                     ki = kconserv[kk,kc,ka]
                     ovvo_tmp[iterkk,iterka,iterkc] = _cp(eris_ovvo_kac[iterkk,iterka,iterkc])
-                    St2 = 2.*t2[ki,:,ka] - t2[:,ki,ka].transpose(0,2,1,3,4)
+#                    St2 = 2.*t2[ki,:,ka]
+                    St2 = 2.*unpack_tril(t2,nkpts,ki,range(nkpts),ka,kconserv[ki,ka,range(nkpts)])
+#                    St2 -= t2[:,ki,ka].transpose(0,2,1,3,4)
+                    St2 -= unpack_tril(t2,nkpts,range(nkpts),ki,ka,kconserv[range(nkpts),ka,ki]).transpose(0,2,1,3,4)
                     ovvo_tmp[iterkk,iterka,iterkc] += einsum('klcd,ilad->kaci',eris_oovv_kXc[iterkk,:,iterkc].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir),
                                                                 St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
                     ovvo_tmp[iterkk,iterka,iterkc] += -einsum('lkcd,ilad->kaci',eris_oovv_Xkc[:,iterkk,iterkc].reshape(nocc*nkpts,nocc,nvir,nvir),
-                                                                t2[ki,:,ka].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                                               unpack_tril(t2,nkpts,ki,range(nkpts),ka,kconserv[ki,ka,range(nkpts)]).transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+#                                                                t2[ki,:,ka].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
         Wkaci[s0,s1,s2] = ovvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
 
         loader.slave_finished()
@@ -716,7 +727,8 @@ def W1ovov(cc,t1,t2,eris,fint=None):
                     kd = kconserv[kk,ki,kb]
                     ovov_tmp[iterkk,iterkb,iterki] = eris_ovov[iterkk,iterkb,iterki].copy()
                     ovov_tmp[iterkk,iterkb,iterki] += -einsum('lkdc,libc->kbid',eris.oovv[:,kk,kd].reshape(nkpts*nocc,nocc,nvir,nvir),
-                                                              t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir))
+#                                                              t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir))
+                                                              unpack_tril(t2,nkpts,range(nkpts),ki,kb,kconserv[range(nkpts),kb,ki]).reshape(nkpts*nocc,nocc,nvir,nvir))
         Wkbid[s0,s1,s2] = ovov_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
         loader.slave_finished()
 
@@ -739,7 +751,7 @@ def W2ovov(cc,t1,t2,eris,fint=None):
 
     ############## Adaptive Blocking :: BEGIN ##############
     mem = 0.5e9
-    pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
+    pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
     BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
@@ -820,6 +832,7 @@ def Wovov(cc,t1,t2,eris,fint=None):
     return Wkbid
 
 
+@profile
 def WovovRev(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -884,6 +897,7 @@ def Woooo(cc,t1,t2,eris,fint=None):
     pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    nkpts_blksize2 = 1
     BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
     loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
@@ -908,7 +922,8 @@ def Woooo(cc,t1,t2,eris,fint=None):
             for iterkl,kl in enumerate(ranges1):
                 for iterki,ki in enumerate(ranges2):
                     kj = kconserv[kk,ki,kl]
-                    tau1 = t2[ki,kj,:].copy()
+#                    tau1 = t2[ki,kj,:].copy()
+                    tau1 = unpack_tril(t2,nkpts,ki,kj,range(nkpts),kconserv[ki,range(nkpts),kj]).copy()
                     tau1[ki] += einsum('ic,jd->ijcd',t1[ki],t1[kj])
                     oooo_tmp[iterkk,iterkl,iterki] = eris_oooo_kli[iterkk,iterkl,iterki].copy()
                     oooo_tmp[iterkk,iterkl,iterki] += einsum('kld,ijd->klij',eris_oovv_klX[iterkk,iterkl,:].transpose(1,2,0,3,4).reshape(nocc,nocc,-1),
@@ -941,6 +956,7 @@ def WooooS(cc,t1,t2,eris,fint=None):
     pre = 1.*nocc*nocc*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    nkpts_blksize2 = 1
     BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
     loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
@@ -965,7 +981,8 @@ def WooooS(cc,t1,t2,eris,fint=None):
             for iterkl,kl in enumerate(ranges1):
                 for iterki,ki in enumerate(ranges2):
                     kj = kconserv[kk,ki,kl]
-                    tau1 = t2[ki,kj,:].copy()
+#                    tau1 = t2[ki,kj,:].copy()
+                    tau1 = unpack_tril(t2,nkpts,ki,kj,range(nkpts),kconserv[ki,range(nkpts),kj]).copy()
                     tau1[ki] += einsum('ic,jd->ijcd',t1[ki],t1[kj])
                     oooo_tmp[iterkk,iterkl,iterki] = eris_oooo_kli[iterkk,iterkl,iterki].copy()
                     oooo_tmp[iterkk,iterkl,iterki] += einsum('kld,ijd->klij',eris_oovv_klX[iterkk,iterkl,:].transpose(1,2,0,3,4).reshape(nocc,nocc,-1),
@@ -981,6 +998,7 @@ def WooooS(cc,t1,t2,eris,fint=None):
 
     return Wklij
 
+@profile
 def Wvvvv(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -995,12 +1013,16 @@ def Wvvvv(cc,t1,t2,eris,fint=None):
     pre = 1.*nvir*nvir*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    nkpts_blksize2 = 1
     BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
     loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
     ############## Adaptive Blocking :: END ################
     vvvv_tmp_size = BLKSIZE + (nvir,nvir,nvir,nvir)
     vvvv_tmp = np.empty(vvvv_tmp_size,dtype=t2.dtype)
+
+    print "vvvv blksize"
+    print BLKSIZE
 
     good2go = True
     while(good2go):
@@ -1020,11 +1042,24 @@ def Wvvvv(cc,t1,t2,eris,fint=None):
                 for iterkc,kc in enumerate(ranges2):
                     kd = kconserv[ka,kc,kb]
                     vvvv_tmp[iterka,iterkb,iterkc] += einsum('klcd,ka,lb->abcd',eris_oovv_abc[iterka,iterkb,iterkc],t1[ka],t1[kb])
+
+                    OOvv   = np.empty( (nkpts,nocc,nocc,nvir,nvir), dtype=t2.dtype)
+                    t2_tmp = np.empty( (nkpts,nocc,nocc,nvir,nvir), dtype=t2.dtype)
+                    #for kk in range(nkpts):
+                    #    # kk + kl - kc - kd = 0
+                    #    # => kl = kc - kk + kd
+                    #    kl = kconserv[kc,kk,kd]
+                    #    vvvv_tmp[iterka,iterkb,iterkc] += einsum('klcd,klab->abcd',eris.oovv[kk,kl,kc],t2[kk,kl,ka])
                     for kk in range(nkpts):
                         # kk + kl - kc - kd = 0
-                        # => kl = kc - kk + kd
                         kl = kconserv[kc,kk,kd]
-                        vvvv_tmp[iterka,iterkb,iterkc] += einsum('klcd,klab->abcd',eris.oovv[kk,kl,kc],t2[kk,kl,ka])
+                        OOvv[kk]   = eris.oovv[kk,kl,kc]
+#                        t2_tmp[kk] = t2[kk,kl,ka]
+                        t2_tmp[kk] = unpack_tril(t2,nkpts,kk,kl,ka,kconserv[kk,ka,kl])
+                    OOvv   = OOvv.reshape(-1,nvir,nvir)
+                    t2_tmp = t2_tmp.reshape(-1,nvir,nvir)
+                    vvvv_tmp[iterka,iterkb,iterkc] += einsum('xcd,xab->abcd',OOvv,t2_tmp)
+
                     vvvv_tmp[iterka,iterkb,iterkc] += einsum('alcd,lb->abcd',eris_vovv[iterka,iterkb,iterkc],-t1[kb])
                     #vvvv_tmp[iterka,iterkb,iterkc] += einsum('bkdc,ka->abcd',eris.vovv[kb,ka,kd],-t1[ka])
                     vvvv_tmp[iterka,iterkb,iterkc] += einsum('kbcd,ka->abcd',eris_ovvv[iterka,iterkb,iterkc],-t1[ka])
@@ -1059,6 +1094,7 @@ def Wvvvo(cc,t1,t2,eris,fint=None):
     pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    nkpts_blksize2 = 1
     BLKSIZE = (1,nkpts_blksize2,nkpts_blksize,)
     loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
@@ -1098,22 +1134,30 @@ def Wvvvo(cc,t1,t2,eris,fint=None):
                         # ka + kl - kc - kd = 0
                         # => kd = ka - kc + kl
                         kd = kconserv[ka,kc,kl]
-                        St2[kl] = 2.*t2[kl,kj,kd] - t2[kl,kj,kb].transpose(0,1,3,2)
+#                        St2[kl] = 2.*t2[kl,kj,kd]
+                        St2[kl] = 2.*unpack_tril(t2,nkpts,kl,kj,kd,kconserv[kl,kd,kj])
+#                        St2[kl] -= t2[kl,kj,kb].transpose(0,1,3,2)
+                        St2[kl] -= unpack_tril(t2,nkpts,kl,kj,kb,kconserv[kl,kb,kj]).transpose(0,1,3,2)
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('alcd,ljdb->abcj',
                                                         eris_vovv_aXc[iterka,:,iterkc].transpose(1,0,2,3,4).reshape(nvir,nkpts*nocc,nvir,nvir),
                                                         St2.reshape(nkpts*nocc,nocc,nvir,nvir))
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lacd,jlbd->abcj',
                                                         eris_ovvv_Xac[:,iterka,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
-                                                        -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+#                                                        -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                                                        -unpack_tril(t2,nkpts,kj,range(nkpts),kb,
+                                                                kconserv[kj,kb,range(nkpts)]).transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lbcd,ljad->abcj',
                                                         eris_ovvv_Xbc[:,iterkb,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
-                                                        -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+#                                                        -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+                                                        -unpack_tril(t2,nkpts,range(nkpts),kj,ka,kconserv[range(nkpts),ka,kj]).reshape(nkpts*nocc,nocc,nvir,nvir))
                     for kl in range(nkpts):
                         kk = kconserv[kb,kl,ka]
-                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+#                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),unpack_tril(t2,nkpts,kl,kk,kb,kconserv[kl,kb,kk]))
 
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lkjc,lb,ka->abcj',eris.ooov[kb,ka,kj],t1[kb],t1[ka])
-                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+#                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],unpack_tril(t2,nkpts,kc,kj,ka,kconserv[kc,ka,kj]))
 
         Wabcj[s0,s1,s2] = vvvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
         loader.slave_finished()
@@ -1124,6 +1168,7 @@ def Wvvvo(cc,t1,t2,eris,fint=None):
 
     return Wabcj
 
+@profile
 def WvvvoR1(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -1164,19 +1209,21 @@ def WvvvoR1(cc,t1,t2,eris,fint=None):
         eris_vovv_aXc = _cp(eris.vovv[s0,:,s2])
         eris_ovvv_Xac = _cp(eris.ovvv[:,s0,s2])
         eris_ovvv_Xbc = _cp(eris.ovvv[:,s1,s2])
+        eris_vovvR1_cXa = _cp(eris.vovvR1[s0,s2,:])
 
         Wvvvv_abc = _cp(WWvvvv[s0,s1,s2])
-        W1voov_abc = _cp(WW1voov[s1,s0,:])
+        W1voov_baX = _cp(WW1voov[s1,s0,:])
         W1ovov_baX = _cp(WW1ovov[s1,s0,:])
 
         for iterka,ka in enumerate(ranges0):
             for iterkb,kb in enumerate(ranges1):
                 for iterkc,kc in enumerate(ranges2):
                     kj = kconserv[ka,kc,kb]
-                    vvvo_tmp[iterka,iterkb,iterkc] = np.array(eris.vovv[kc,kj,ka]).transpose(2,3,0,1).conj()
+                    #vvvo_tmp[iterka,iterkb,iterkc] = np.array(eris.vovv[kc,kj,ka]).transpose(2,3,0,1).conj()
+                    vvvo_tmp[iterka,iterkb,iterkc] = np.array(eris_vovvR1_cXa[iterka,iterkc,kj]).transpose(2,3,0,1).conj()
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('abcd,jd->abcj',Wvvvv_abc[iterka,iterkb,iterkc],t1[kj])
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lajc,lb->abcj',W1ovov_baX[iterkb,iterka,kj],-t1[kb])
-                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('bkjc,ka->abcj',W1voov_abc[iterkb,iterka,kj],-t1[ka])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('bkjc,ka->abcj',W1voov_baX[iterkb,iterka,kj],-t1[ka])
 
                     kl_ranges = range(nkpts)
                     kd_ranges = kconserv[ka,kc,kl_ranges]
@@ -1185,22 +1232,45 @@ def WvvvoR1(cc,t1,t2,eris,fint=None):
                         # ka + kl - kc - kd = 0
                         # => kd = ka - kc + kl
                         kd = kconserv[ka,kc,kl]
-                        St2[kl] = 2.*t2[kl,kj,kd] - t2[kl,kj,kb].transpose(0,1,3,2)
+#                        St2[kl] = 2.*t2[kl,kj,kd]
+                        St2[kl] = 2.*unpack_tril(t2,nkpts,kl,kj,kd,kconserv[kl,kd,kj])
+#                        St2[kl] -= t2[kl,kj,kb].transpose(0,1,3,2)
+                        St2[kl] -= unpack_tril(t2,nkpts,kl,kj,kb,kconserv[kl,kb,kj]).transpose(0,1,3,2)
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('alcd,ljdb->abcj',
                                                         eris_vovv_aXc[iterka,:,iterkc].transpose(1,0,2,3,4).reshape(nvir,nkpts*nocc,nvir,nvir),
                                                         St2.reshape(nkpts*nocc,nocc,nvir,nvir))
+                    #vvvo_tmp[iterka,iterkb,iterkc] += einsum('alcd,ljdb->abcj',
+                    #                                    eris_vovvR1_aXc[iterkc,iterka,:].transpose(1,0,2,3,4).reshape(nvir,nkpts*nocc,nvir,nvir),
+                    #                                    St2.reshape(nkpts*nocc,nocc,nvir,nvir))
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lacd,jlbd->abcj',
                                                         eris_ovvv_Xac[:,iterka,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
-                                                        -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                                                        -unpack_tril(t2,nkpts,kj,range(nkpts),kb,
+                                                            kconserv[kj,kb,range(nkpts)]).transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                    #vvvo_tmp[iterka,iterkb,iterkc] += einsum('lacd,jlbd->abcj',
+                    #                                    eris_ovvvRev_Xac[iterkc,iterka,:].reshape(nkpts*nocc,nvir,nvir,nvir),
+                    #                                    -t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lbcd,ljad->abcj',
                                                         eris_ovvv_Xbc[:,iterkb,iterkc].reshape(nkpts*nocc,nvir,nvir,nvir),
-                                                        -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+                                                        -unpack_tril(t2,nkpts,range(nkpts),kj,ka,
+                                                            kconserv[range(nkpts),ka,kj]).reshape(nkpts*nocc,nocc,nvir,nvir))
+                    #vvvo_tmp[iterka,iterkb,iterkc] += einsum('lbcd,ljad->abcj',
+                    #                                    eris_ovvvRev_Xbc[iterkc,iterkb,:].reshape(nkpts*nocc,nvir,nvir,nvir),
+                    #                                    -t2[:,kj,ka].reshape(nkpts*nocc,nocc,nvir,nvir))
+                    #for kl in range(nkpts):
+                    #    kk = kconserv[kb,kl,ka]
+                    #    vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+                    eris_ovoo_jcX = _cp(eris.ovoo[kj,kc,:])
+                    t2_tmp = np.empty( (nkpts,nocc,nocc,nvir,nvir), dtype=t2.dtype)
                     for kl in range(nkpts):
                         kk = kconserv[kb,kl,ka]
-                        vvvo_tmp[iterka,iterkb,iterkc] += einsum('jclk,lkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+                        t2_tmp[kl] = unpack_tril(t2,nkpts,kl,kk,kb,kconserv[kl,kb,kk])
+                    #vvvo_tmp[iterka,iterkb,iterkc] += einsum('xjclk,xlkba->abcj',eris.ovoo[kj,kc,kl].conj(),t2[kl,kk,kb])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('jcx,xba->abcj',eris_ovoo_jcX.transpose(1,2,0,3,4).reshape(nocc,nvir,-1).conj(),
+                                                            t2_tmp.reshape(-1,nvir,nvir))
 
                     vvvo_tmp[iterka,iterkb,iterkc] += einsum('lkjc,lb,ka->abcj',eris.ooov[kb,ka,kj],t1[kb],t1[ka])
-                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+#                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],t2[kc,kj,ka])
+                    vvvo_tmp[iterka,iterkb,iterkc] += einsum('lc,ljab->abcj',-FFov[kc],unpack_tril(t2,nkpts,kc,kj,ka,kconserv[kc,ka,kj]))
 
         Wabcj[s2,s0,s1] = vvvo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)].transpose(2,0,1,3,4,5,6)
         loader.slave_finished()
@@ -1234,6 +1304,7 @@ def Wovoo(cc,t1,t2,eris,fint=None):
     pre = 1.*nocc*nvir*nvir*nvir*nkpts*16
     nkpts_blksize = min(max(int(np.floor(mem/pre)),1),nkpts)
     nkpts_blksize2 = min(max(int(np.floor(mem/(pre*nkpts_blksize))),1),nkpts)
+    nkpts_blksize2 = 1
     BLKSIZE = (nkpts_blksize2,nkpts_blksize,nkpts,)
     print BLKSIZE
     loader = mpi_load_balancer.load_balancer(BLKSIZE=BLKSIZE)
@@ -1271,19 +1342,26 @@ def Wovoo(cc,t1,t2,eris,fint=None):
                     ovoo_tmp[iterkk,iterkb,iterki] += einsum('bkjc,ic->kbij',WW1voov_bkX[iterkb,iterkk,kj],t1[ki])
 
                     ovoo_tmp[iterkk,iterkb,iterki] += einsum('lkid,jlbd->kbij', -eris_ooov_XkX[:,iterkk,ki].reshape(nkpts*nocc,nocc,nocc,nvir),
-                                                                  t2[kj,:,kb].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                                                                  unpack_tril(t2,nkpts,kj,range(nkpts),kb,
+                                                                      kconserv[kj,kb,range(nkpts)]).transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
                     ovoo_tmp[iterkk,iterkb,iterki] += einsum('lkjd,libd->kbij', -eris_ooov_XkX[:,iterkk,kj].reshape(nkpts*nocc,nocc,nocc,nvir),
-                                                                  t2[:,ki,kb].reshape(nkpts*nocc,nocc,nvir,nvir))
+                                                                  unpack_tril(t2,nkpts,range(nkpts),ki,kb,
+                                                                      kconserv[range(nkpts),kb,ki]).reshape(nkpts*nocc,nocc,nvir,nvir))
 
-                    St2 = 2.*t2[kj,:,kb] - t2[:,kj,kb].transpose(0,2,1,3,4)
+#                    St2 = 2.*t2[kj,:,kb]
+                    St2 = 2.*unpack_tril(t2,nkpts,kj,range(nkpts),kb,kconserv[kj,kb,range(nkpts)])
+#                    St2 -= t2[:,kj,kb].transpose(0,2,1,3,4)
+                    St2 -= unpack_tril(t2,nkpts,range(nkpts),kj,kb,kconserv[range(nkpts),kb,kj]).transpose(0,2,1,3,4)
                     St2 = St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir)
                     ovoo_tmp[iterkk,iterkb,iterki] += einsum('klid,jlbd->kbij', eris_ooov_kXi[iterkk,:,iterki].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nocc,nvir), St2)
 
-                    tau1 = t2[kj,ki,:].copy()
+#                    tau1 = t2[kj,ki,:].copy()
+                    tau1 = unpack_tril(t2,nkpts,kj,ki,range(nkpts),kconserv[kj,range(nkpts),ki]).copy()
                     tau1[kj] += einsum('jd,ic->jidc',t1[kj],t1[ki])
                     ovoo_tmp[iterkk,iterkb,iterki] += einsum('bkdc,jidc->kbij', eris_vovv_bkX[iterkb,iterkk,:].transpose(1,2,0,3,4).reshape(nvir,nocc,nvir*nkpts,nvir),
                                                                 tau1.transpose(1,2,0,3,4).reshape(nocc,nocc,nkpts*nvir,nvir))
-                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('kc,ijcb->kbij', FFov[kk],t2[ki,kj,kk])
+#                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('kc,ijcb->kbij', FFov[kk],t2[ki,kj,kk])
+                    ovoo_tmp[iterkk,iterkb,iterki] += einsum('kc,ijcb->kbij', FFov[kk],unpack_tril(t2,nkpts,ki,kj,kk,kconserv[ki,kk,kj]))
 
         Wkbij[s0,s1,s2] = ovoo_tmp[:len(ranges0),:len(ranges1),:len(ranges2)]
         loader.slave_finished()
@@ -1294,6 +1372,7 @@ def Wovoo(cc,t1,t2,eris,fint=None):
 
     return Wkbij
 
+@profile
 def W1voov(cc,t1,t2,eris,fint=None):
     nkpts, nocc, nvir = t1.shape
     kconserv = cc.kconserv
@@ -1333,11 +1412,15 @@ def W1voov(cc,t1,t2,eris,fint=None):
                 for iterkc,kc in enumerate(ranges2):
                     ki = kconserv[kk,kc,ka]
                     ovvo_tmp[iterkk,iterka,iterkc] = _cp(eris_ovvo_kac[iterkk,iterka,iterkc])
-                    St2 = 2.*t2[ki,:,ka] - t2[:,ki,ka].transpose(0,2,1,3,4)
+#                    St2 = 2.*t2[ki,:,ka]
+                    St2 = 2.*unpack_tril(t2,nkpts,ki,range(nkpts),ka,kconserv[ki,ka,range(nkpts)])
+#                    St2 -= t2[:,ki,ka].transpose(0,2,1,3,4)
+                    St2 -= unpack_tril(t2,nkpts,range(nkpts),ki,ka,kconserv[range(nkpts),ka,ki]).transpose(0,2,1,3,4)
                     ovvo_tmp[iterkk,iterka,iterkc] += einsum('klcd,ilad->kaci',eris_oovv_kXc[iterkk,:,iterkc].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir),
                                                                 St2.transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
                     ovvo_tmp[iterkk,iterka,iterkc] += -einsum('lkcd,ilad->kaci',eris_oovv_Xkc[:,iterkk,iterkc].reshape(nocc*nkpts,nocc,nvir,nvir),
-                                                                t2[ki,:,ka].transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
+                                                                unpack_tril(t2,nkpts,ki,range(nkpts),ka,
+                                                                    kconserv[ki,ka,range(nkpts)]).transpose(1,0,2,3,4).reshape(nocc,nkpts*nocc,nvir,nvir))
 
                     Wkaci[ka,kk,ki] = ovvo_tmp[iterkk,iterka,iterkc].transpose(1,0,3,2)
 

@@ -57,20 +57,20 @@ def ifft(g, gs):
     return np.ravel(f3d)
 
 
-def fftk(f, gs, r, k):
+def fftk(f, gs, expmikr):
     '''Perform the 3D FFT of a real-space function which is (periodic*e^{ikr}).
 
     fk(k+G) = \sum_r fk(r) e^{-i(k+G)r} = \sum_r [f(k)e^{-ikr}] e^{-iGr}
     '''
-    return fft(f*np.exp(-1j*np.dot(k,r.T)), gs)
+    return fft(f*expmikr, gs)
 
 
-def ifftk(g, gs, r, k):
+def ifftk(g, gs, expikr):
     '''Perform the 3D inverse FFT of f(k+G) into a function which is (periodic*e^{ikr}).
 
     fk(r) = (1/Ng) \sum_G fk(k+G) e^{i(k+G)r} = (1/Ng) \sum_G [fk(k+G)e^{iGr}] e^{ikr}
     '''
-    return ifft(g, gs) * np.exp(1j*np.dot(k,r.T))
+    return ifft(g, gs) * expikr
 
 
 def get_coulG(cell, k=np.zeros(3), exx=False, mf=None):
@@ -217,6 +217,7 @@ def super_cell(cell, ncopy):
     supcell.build(False, False)
     return supcell
 
+kconserver = None
 
 def get_kconserv(cell, kpts):
     '''Get the momentum conservation array for a set of k-points.

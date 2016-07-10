@@ -13,7 +13,7 @@ method = 'arnoldi'
 
 VERBOSE = True
 
-def eigs(matvec,size,nroots,tol=1e-6,Adiag=None,targetFn=None,filename=None):
+def eigs(matvec,size,nroots,xstart=None,tol=1e-6,Adiag=None,rootTarget=None,targetFn=None,filename=None):
     '''Davidson diagonalization method to solve A c = E c
     when A is not Hermitian.
     '''
@@ -26,10 +26,15 @@ def eigs(matvec,size,nroots,tol=1e-6,Adiag=None,targetFn=None,filename=None):
 
     if method == 'arnoldi':
         # Currently not used:
-        x = np.ones((size,1))
-        if Adiag is None:
-            Adiag = np.ones((size,1))
-        arnold = Arnoldi(matvec_args, x, inPreCon=Adiag, nroots=nroots, tol=tol, targetFn=targetFn, filename=filename)
+        if xstart is None:
+            xstart = np.ones((1,size))
+        if rootTarget is None:
+            if Adiag is None:
+                Adiag = np.ones((size,1))
+            arnold = Arnoldi(matvec_args, np.ones((size,1)), inPreCon=Adiag, nroots=nroots, tol=tol, targetFn=targetFn, filename=filename)
+        else:
+            arnold = DavidsonTarget(matvec_args, size, xstart, rootTarget, preCon=Adiag, nroots=nroots,
+                                    tol=tol, targetFn=targetFn, filename=filename)
         return arnold.solve()
         #e,c,m = davidson(matvec,size,nroots,Adiag=Adiag)
         #return e,c
@@ -144,20 +149,192 @@ def diagonalize_asymm(H):
 
     return E,C
 
+class DavidsonTarget:
+    def __init__(self, matr_multiply, size, xstart, rootTarget, nroots=1, tol=1e-5, max_m=100,
+                 preCon=None, targetFn=None, filename=None):
+        self.tol = tol
+        self.size = size
+        self.nroots = min(nroots,self.size)
+        self._nroots = self.nroots
+        self.maxM = min(max_m,self.size)
+        self.xstart = xstart
+        self.rootTarget = rootTarget
+        self.matrMultiply = matr_multiply
+        self.targetFn = targetFn
+        if self.targetFn is not None:
+            self.nroots = min(self.nroots,self.targetFn())
+        if len(rootTarget) != self.nroots and len(rootTarget) != 1:
+            print "Must provide the same number of rootTargets as nroots (=%3d)!" % self.nroots
+            sys.exit()
+        self.filename = filename
+
+        self.writeout = 10
+        self.nconverged = 0
+        self.preCon = preCon
+        self.totalIter = 0
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+
+    def initial_guess(self):
+        v = np.random.rand(size)
+        return v
+
+    def orthogonalize_initial(self, vlist):
+        for j in range(self.newSize):
+            for i in range(j):
+                vlist[j,:] -= np.dot(vlist[i,:].conj(),vlist[j,:]) * vlist[i,:]
+            for i in range(j):
+                vlist[j,:] -= np.dot(vlist[i,:].conj(),vlist[j,:]) * vlist[i,:]
+            vlist[j,:] /= np.linalg.norm(vlist[j,:])
+        #assert(np.linalg.norm(np.identity(self.newSize) - np.dot(vlist[:self.newSize,:].conj(),vlist[:self.newSize,:].T)) < 1e-14)
+        return
+
+    def solve(self):
+        iroot = 0
+        it = 0
+        Hmatrix = np.zeros((self.maxM,self.maxM),dtype=complex)
+        Gmatrix = np.zeros((self.maxM,self.maxM),dtype=complex)
+        wlist = np.zeros((self.maxM,self.size),  dtype=complex)
+        vlist = np.zeros((self.maxM,self.size),  dtype=complex)
+        Avlist = np.zeros((self.maxM,self.size), dtype=complex)
+
+        oldSize = 0
+        if self.xstart is None:
+            vlist[0,:] = self.initial_guess()
+            self.newSize = 1
+        else:
+            assert (self.xstart.size % self.size==0)
+            nguess = self.xstart.size / self.size
+            vlist[:nguess,:] = self.xstart
+            # If initial guess has less vectors than nroots, fill the rest with random numbers
+            #
+            for i in range(nguess,self.nroots):
+                vlist[i,:] = np.random.rand(self.size)
+            self.newSize = max(nguess,self.nroots)
+
+        #self.newSize = self.nroots
+        targetFreq = self.rootTarget[0]
+        while (self.nconverged<self.nroots):
+            # Orthogonalizing initial subspace
+            #
+            if oldSize == 0:
+                self.orthogonalize_initial(vlist)
+            # Could be set up to do block multiplies...
+            #
+            for iroot in range(oldSize,self.newSize):
+                Avlist[iroot,:] = self.matrMultiply(vlist[iroot,:]) - targetFreq*vlist[iroot,:]
+            for i in range(self.newSize):
+                for j in range(oldSize,self.newSize):
+                    Hmatrix[i,j] = np.dot(Avlist[i,:].conj(), vlist[j,:].T)
+                    Gmatrix[i,j] = np.dot(Avlist[i,:].conj(),Avlist[j,:].T)
+            for i in range(oldSize,self.newSize):
+                for j in range(oldSize):
+                    Hmatrix[i,j] = np.dot(Avlist[i,:].conj(), vlist[j,:].T)
+                    Gmatrix[i,j] = np.dot(Avlist[i,:].conj(),Avlist[j,:].T)
+
+            # Computing eigenpairs... Sometimes the generalized scipy eigenvalue routine doesn't work
+            # very well, so instead of Ax = sBx we calculate  Binv A x = s x
+            #
+            invHdotG =  np.dot(np.linalg.inv(Hmatrix[:self.newSize,:self.newSize]),Gmatrix[:self.newSize,:self.newSize])
+            w, v = scipy.linalg.eig(invHdotG)
+            #w, v = scipy.linalg.eig(Gmatrix[:newSize,:newSize],b=Hmatrix[:newSize,:newSize])
+            for i in range(len(w)):
+                v[:,i] /= np.linalg.norm(v[:,i])
+            idx = np.argsort(abs(w))
+            w = w[idx]
+            v = v[:,idx]
+            # Targeting roots
+            #
+            target_eigenvalues = range(self.nroots)
+            whichRoot = self.nconverged
+            if self.targetFn is not None:
+                target_eigenvalues, in_nroots = self.targetFn(np.dot(vlist[:self.newSize,:].T,v[:self.newSize,:self.newSize]))
+                self.nroots = min(self._nroots,in_nroots)
+            #print self._nroots,in_nroots
+            target_v = v[:,target_eigenvalues[whichRoot]]
+            target_w = w[target_eigenvalues[whichRoot]]
+
+            # Making new rayleigh (5) and ritz vector
+            #
+            Hz = np.dot(Hmatrix[:self.newSize,:self.newSize],target_v)
+            rho = np.dot(Hz.T.conj(),target_v) + targetFreq
+            y = np.dot(vlist[:self.newSize,:].T,target_v)
+
+            # residual (6)
+            residual = self.matrMultiply(y) - rho * y
+            dres = np.linalg.norm(residual)
+            dres = self.comm.bcast(dres, root=0)
+            if self.rank == 0:
+                print "rho, residual = ", rho, dres, self.nroots
+
+            if dres < self.tol:
+                print "Eigenvalue %3d converged!" % self.nconverged
+                self.nconverged += 1
+
+            if self.nconverged >= self.nroots:
+                print "converged in %3d cycles!" % self.totalIter
+                evals = np.zeros(self.nroots,dtype=complex)
+                evecs = np.zeros((self.size,self.nroots),dtype=complex)
+                for iroot in range(self.nroots):
+                    target_v = v[:,target_eigenvalues[iroot]]
+                    Hz = np.dot(Hmatrix[:self.newSize,:self.newSize],target_v)
+                    rho = np.dot(Hz.T.conj(),target_v) + targetFreq
+                    y = np.dot(vlist[:self.newSize,:].T,target_v)
+                    evals[iroot] = rho
+                    evecs[:,iroot] = y
+                return evals, evecs
+
+            # precondition and orthonormalize u (8)
+            if self.preCon is None:
+                u = residual
+            else:
+                #u = [residual[i] / (self.preCon[i] - rho - targetFreq + 1e-8) for i in range(len(residual))]
+                #u = [residual[i] / (self.preCon[i] - targetFreq - rho + 1e-8) for i in range(len(residual))]
+                #u = [residual[i] / (self.preCon[i] - targetFreq + 1e-8) for i in range(len(residual))]
+                u = [residual[i] / (self.preCon[i] - rho) for i in range(len(residual))]
+
+            for i in range(self.newSize):
+                u -= np.dot(vlist[i,:].T.conj(),u) * vlist[i,:].reshape(self.size)
+            for i in range(self.newSize):
+                u -= np.dot(vlist[i,:].T.conj(),u) * vlist[i,:].reshape(self.size)
+            u /= np.linalg.norm(u)
+
+            oldSize = self.newSize
+            if self.newSize == self.maxM:
+                # Deflating
+                oldSize = 0
+                self.newSize = self.nroots
+                if self.rank == 0:
+                    print "deflating....", self.newSize
+                #if self.targetFn is not None:
+                #    target_eigenvalues, in_nroots = self.targetFn(np.dot(vlist[:self.newSize,:].T,v[:self.newSize,:self.newSize]))
+                vlist[:self.newSize] = np.dot(vlist[:,:].T,v[:,target_eigenvalues[:self.newSize]]).T
+                continue
+
+            if self.newSize == self.size:
+                print "breaking..."
+                break
+
+            vlist[self.newSize,:] = u
+            self.newSize += 1
+            self.totalIter += 1
+
+
 class Arnoldi(object):
     def __init__(self,matr_multiply,xStart,inPreCon=None,nroots=1,tol=1e-6,targetFn=None,filename=None):
         self.matrMultiply = matr_multiply
         self.size = xStart.shape[0]
         self.nEigen = min(nroots, self.size)
         self.maxM = min(300, self.size)
-        self.maxOuterLoop = 10
+        self.maxIter = 100
         self.tol = tol
-	self.targetFn=targetFn
+        self.targetFn=targetFn
+        self.failed_convergence = False
         if self.targetFn is not None:
             # for no arguments, the targetFn should return the maximum number of roots to find
             self.nEigen = min(self.nEigen,self.targetFn())
 
-	self.filename=filename
+        self.filename=filename
 
         self.writeout = 10
         self.nconverged = 0
@@ -179,7 +356,7 @@ class Arnoldi(object):
         self.allocateVecs()
 
     def solve(self):
-        while self.converged == 0:
+        while self.converged is False and self.failed_convergence is False:
             if self.totalIter == 0:
                 self.guessInitial()
             for i in xrange(self.maxM):
@@ -196,7 +373,7 @@ class Arnoldi(object):
                 self.computeResidual()
                 self.checkConvergence()
                 self.deflated = 0
-                if self.converged:
+                if self.converged is True or self.failed_convergence is True:
                     break
 
                 self.updateVecs()
@@ -209,6 +386,9 @@ class Arnoldi(object):
             if self.rank == 0:
                 print "\nConverged in %3d cycles" % self.totalIter
         self.constructAllSolV()
+        if self.failed_convergence:
+            self.outeigs[self.nconverged:] = -999.9
+            self.outevecs[:,self.nconverged:] *= 0.0
         return self.outeigs, self.outevecs
 
     def allocateVecs(self):
@@ -240,15 +420,21 @@ class Arnoldi(object):
         nrm = np.linalg.norm(self.x0)
         self.x0 *= 1./nrm
         self.currentSize = self.nEigen
-        for i in xrange(self.currentSize):
-            self.vlist[i] *= 0.0
-            self.vlist[i,i] += 1. #np.random.rand(self.size)
-            #self.vlist[i,i] /= np.linalg.norm(self.vlist[i,i])
-            #self.vlist[i,i] *= 12.
-            #for j in xrange(i):
-            #    fac = np.vdot( self.vlist[j,:], self.vlist[i,:] )
-            #    self.vlist[i,:] -= fac * self.vlist[j,:]
-            #self.vlist[i,:] /= np.linalg.norm(self.vlist[i,:])
+        if self.preCon is not None:
+            vals = np.argsort(self.preCon)
+            for i in xrange(self.currentSize):
+                self.vlist[i] *= 0.0
+                self.vlist[i,vals[i]] += 1. #np.random.rand(self.size)
+        else:
+            for i in xrange(self.currentSize):
+                self.vlist[i] *= 0.0
+                self.vlist[i,i] += 1. #np.random.rand(self.size)
+                #self.vlist[i,i] /= np.linalg.norm(self.vlist[i,i])
+                #self.vlist[i,i] *= 12.
+                #for j in xrange(i):
+                #    fac = np.vdot( self.vlist[j,:], self.vlist[i,:] )
+                #    self.vlist[i,:] -= fac * self.vlist[j,:]
+                #self.vlist[i,:] /= np.linalg.norm(self.vlist[i,:])
 
     	#################################
     	# Reading amplitudes from file  #
@@ -306,7 +492,7 @@ class Arnoldi(object):
         w = w[idx].real
 
         # WARNING : small numerical errors sometimes build up if we don't broadcast
-        #   the following.  Because of this, we can have, for example, eigenvalue 
+        #   the following.  Because of this, we can have, for example, eigenvalue
         #   2 converge on processor 1 while eigenvalue 3 doesn't converge on processor
         #   0.  So both of these two processors will be finding approximations for
         #   different eigenvalues.
@@ -327,7 +513,7 @@ class Arnoldi(object):
         self.evecs[:self.currentSize,:self.currentSize] = v
         self.eigs[:self.currentSize] = w[:self.currentSize]
 
-	self.target_eigenvalues = range(self.nEigen)
+        self.target_eigenvalues = range(self.nEigen)
         if self.targetFn is not None:
             self.target_eigenvalues = self.targetFn(np.dot(self.vlist[:self.currentSize].transpose(),self.evecs[:self.currentSize,:self.currentSize]))
 
@@ -339,7 +525,7 @@ class Arnoldi(object):
             feri4 = h5py.File(self.filename, 'w')#, driver='mpio', comm=MPI.COMM_WORLD)
             ds_type = complex
             out_vec = feri4.create_dataset('vec', (self.nEigen,self.size), dtype=ds_type)
-            out_vec[:] = self.outevecs.T[:] 
+            out_vec[:] = self.outevecs.T[:]
             feri4.close()
         self.comm.Barrier()
         #################################
@@ -373,7 +559,9 @@ class Arnoldi(object):
         # Preconditioning if necessary
         #
         if self.preCon is not None:
-            self.res = [self.res[i] / (self.preCon[i] - self.cvEig) for i in range(len(self.res))]
+            divisor  = [np.sign(self.preCon[i] - self.cvEig + 1e-14) * max(abs(self.preCon[i] - self.cvEig),1e-8) for i in range(len(self.res))]
+            #self.res = [self.res[i] / (self.preCon[i] - self.cvEig) for i in range(len(self.res))]
+            self.res = [self.res[i] / divisor[i] for i in range(len(self.res))]
         self.res = np.array(self.res).reshape(-1)
 
         self.dres = np.vdot(self.res,self.res)**0.5
@@ -399,7 +587,7 @@ class Arnoldi(object):
             if orthog > 1e-8:
                 sys.exit( "Exiting davidson procedure ... orthog = %24.16f" % orthog )
         orthog = orthog ** 0.5
-	self.resnorm = self.comm.bcast(self.resnorm, root=0)
+        self.resnorm = self.comm.bcast(self.resnorm, root=0)
         if VERBOSE:
             if self.rank == 0:
             	print "%3d %20.14f %20.14f  %10.4g" % (self.nconverged, self.cvEig.real, self.resnorm.real, orthog.real)
@@ -419,6 +607,8 @@ class Arnoldi(object):
                 if self.rank == 0:
                     print "Eigenvalue %3d converged! (res = %.15g)" % (self.ciEig, self.resnorm)
             self.nconverged += 1
+        if self.totalIter >= self.maxIter:
+            self.failed_convergence = True
         if self.nconverged == self.nEigen:
             self.converged = True
         if self.resnorm < self.tol and not self.converged:

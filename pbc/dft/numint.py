@@ -1,12 +1,15 @@
 import numpy
 from pyscf.dft.numint import _dot_ao_ao, _dot_ao_dm, BLKSIZE
+from mpi4py import MPI
+import h5py
 import pyscf.lib
 import pyscf.dft
 from pyscf.pbc import tools
 
+rank = MPI.COMM_WORLD.Get_rank()
 ## Moderate speedup by caching eval_ao
 from joblib import Memory
-memory = Memory(cachedir='./tmp/', mmap_mode='r', verbose=0)
+memory = Memory(cachedir='./tmp' + str(rank) + '/', mmap_mode='r', verbose=0)
 @memory.cache
 def eval_ao(cell, coords, kpt=None, deriv=0, relativity=0, bastart=0,
             bascount=None, non0tab=None, verbose=None):

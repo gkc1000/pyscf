@@ -1328,7 +1328,7 @@ def Wovoo(cc,t1,t2,eris,fint=None):
 
         eris_vovv_bkX = _cp(eris.vovv[s1,s0,:])
         eris_ooov_XkX = _cp(eris.ooov[:,s0,:])
-        eris_ooov_kXi = _cp(eris.ooov[s0,:,s1])
+        eris_ooov_kXi = _cp(eris.ooov[s0,:,s2])
 
         for iterkk,kk in enumerate(ranges0):
             for iterkb,kb in enumerate(ranges1):

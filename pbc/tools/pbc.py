@@ -3,6 +3,9 @@ import numpy as np
 import scipy.linalg
 from pyscf import lib
 
+import pyfftw
+
+
 def fft(f, gs):
     '''Perform the 3D FFT from real (R) to reciprocal (G) space.
 
@@ -28,7 +31,13 @@ def fft(f, gs):
     '''
     ngs = 2*np.asarray(gs)+1
     f3d = np.reshape(f, ngs)
-    g3d = np.fft.fftn(f3d)
+    #g3d = np.fft.fftn(f3d)
+    pyfftw.interfaces.cache.enable()
+    g3d = pyfftw.interfaces.numpy_fft.fftn(f3d,
+            overwrite_input=True,
+            planner_effort='FFTW_MEASURE',
+            #threads=2,
+            auto_align_input=False)
     return np.ravel(g3d)
 
 
@@ -53,7 +62,13 @@ def ifft(g, gs):
     '''
     ngs = 2*np.asarray(gs)+1
     g3d = np.reshape(g, ngs)
-    f3d = np.fft.ifftn(g3d)
+    #f3d = np.fft.ifftn(g3d)
+    pyfftw.interfaces.cache.enable()
+    f3d = pyfftw.interfaces.numpy_fft.ifftn(g3d,
+            overwrite_input=True,
+            planner_effort='FFTW_MEASURE',
+            #threads=2,
+            auto_align_input=False)
     return np.ravel(f3d)
 
 
@@ -73,7 +88,7 @@ def ifftk(g, gs, expikr):
     return ifft(g, gs) * expikr
 
 
-def get_coulG(cell, k=np.zeros(3), exx=False, mf=None):
+def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, G0eq0=True):
     '''Calculate the Coulomb kernel for all G-vectors, handling G=0 and exchange.
 
     Args:
@@ -98,7 +113,7 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None):
     equal2boundary = np.where( abs(abs(reduced_coords) - 1.) < 1e-14 )[0]
     factor = np.trunc(reduced_coords)
     kG -= 2.*np.dot(np.sign(factor), box_edge)
-    kG[equal2boundary] = [0.0, 0.0, 0.0]
+    #kG[equal2boundary] = [0.0, 0.0, 0.0]
     # Done wrapping.
 
     absG2 = np.einsum('gi,gi->g', kG, kG)
@@ -110,10 +125,43 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None):
     Nk = len(kpts)
 
     if exx is False or mf.exxdiv is None:
-        with np.errstate(divide='ignore'):
-            coulG = 4*np.pi/absG2
-        if np.linalg.norm(k) < 1e-8:
-            coulG[0] = 0.
+        if cell.dimension == 1:
+            if mf.exx_built == False:
+                mf.precompute_exx1D()
+            with np.errstate(divide='ignore',invalid='ignore'):
+                coulG = 4*np.pi/absG2*(1.0 - np.exp(-absG2/(4*mf.exx_alpha**2))) + 0j
+            if np.linalg.norm(k) < 1e-8:
+                coulG[0] = np.pi / mf.exx_alpha**2
+
+            # Index k+cell.Gv into the precomputed vq and add on
+            gxyz = np.round(np.dot(kG, mf.exx_kcell.h)/(2*np.pi)).astype(int)
+            ngs  = 2*mf.exx_kcell.gs+1
+            gxyz = (gxyz + ngs)%(ngs)
+            old_qidx = (gxyz[:,0]*ngs[1] + gxyz[:,1])*ngs[2] + gxyz[:,2]
+            for igz,gz in enumerate(np.unique(kG[:,2].round(decimals=14))):
+                # for a given gz, finds all kG with kGz = gz
+                kGz_loc = [ abs(kG[:,2] - gz)<1e-10 ]
+                # finds the index in our convolution list of the given gz
+                exx_loc = np.where( abs(mf.exx_gz - abs(gz))<1e-10 )[0][0]
+                qidx = old_qidx[ kGz_loc ]
+                coulG[ kGz_loc ] += mf.exx_vq[ exx_loc, qidx ]
+
+            #if G0eq0 is True:
+            #    if np.linalg.norm(k) < 1e-8:
+            #        coulG[0] = 0.0
+        elif cell.dimension == 2:
+            L = cell._h[2,2]
+            Gz = kG[:,2]
+            Gp = np.array([np.linalg.norm(x) for x in kG[:,:2]])
+            with np.errstate(divide='ignore',invalid='ignore'):
+                coulG = 4*np.pi/absG2 * ( 1. - np.cos(Gz*L/2.)*np.exp(-Gp*L/2.) )
+            if np.linalg.norm(k) < 1e-8:
+                coulG[0] = -np.pi * L**2 / 2.
+        else:
+            with np.errstate(divide='ignore'):
+                coulG = 4*np.pi/absG2
+            if np.linalg.norm(k) < 1e-8:
+                coulG[0] = 0.
     elif mf.exxdiv == 'vcut_sph':
         Rc = (3*Nk*cell.vol/(4*np.pi))**(1./3)
         with np.errstate(divide='ignore',invalid='ignore'):
@@ -143,6 +191,7 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None):
         coulG += mf.exx_vq[qidx] * is_lt_maxqv
 
     coulG[ coulG == np.inf ] = 0.0
+    coulG[ equal2boundary ] = 0.0
 
     return coulG
 
@@ -162,14 +211,10 @@ def madelung(cell, kpts):
     ecell.build(False,False)
     return -2*ewald(ecell, ecell.ew_eta, ecell.ew_cut)
 
-
-def get_monkhorst_pack_size(cell, ckpts):
-    kpts = np.dot(ckpts, cell._h.T) / (2*np.pi)
-    import ase.dft.kpoints
-    Nk, eoff = ase.dft.kpoints.get_monkhorst_pack_size_and_offset(kpts)
-    #Nk = np.array([len(np.unique(ki)) for ki in kpts.T])
+def get_monkhorst_pack_size(cell, kpts):
+    skpts = cell.get_scaled_kpts(kpts).round(decimals=6)
+    Nk = np.array([len(np.unique(ki)) for ki in skpts.T])
     return Nk
-
 
 def f_aux(cell, q):
     a = cell._h.T

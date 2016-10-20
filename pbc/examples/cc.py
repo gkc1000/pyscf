@@ -1,6 +1,7 @@
 import numpy as np
 import shutil
 import os.path
+import sys
 import os
 from pyscf.pbc import cc as pbccc
 from mpi4py import MPI
@@ -16,12 +17,12 @@ def run_krccsd(mf):
     cc.kernel()
     return cc
 
-def run_ip_krccsd(cc, nroots=9, klist=None):
+def run_ip_krccsd(cc, nroots=3, klist=None):
     e,c = cc.ipccsd(nroots, klist)
     comm.Barrier()
     return e,c
 
-def run_ea_krccsd(cc, nroots=9, klist=None):
+def run_ea_krccsd(cc, nroots=3, klist=None):
     e,c = cc.eaccsd(nroots, klist)
     comm.Barrier()
     return e,c
@@ -32,9 +33,10 @@ def run_eom_krccsd_bands(cell, nmp, kpts_red):
     qp_kn = []
     vbmax = -99
     cbmin = 99
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
 
     for kpt in kpts_red:
-        mf = run_khf(cell, nmp=nmp, scaled_kshift=kpt, exxdiv=None)
+        mf = run_khf(cell, nmp=nmp, scaled_kshift=kpt, gamma=True, exxdiv=None)
         # Setting up everything for MPI after mean field
         comm.Barrier()
         mo_coeff  = comm.bcast(mf.mo_coeff,root=0)
@@ -57,6 +59,9 @@ def run_eom_krccsd_bands(cell, nmp, kpts_red):
         eip, cip = eip[0], cip[0]
         qpip = np.linalg.norm(cip[:nocc],axis=0)**2
 
+        #if os.path.isfile("eom_intermediates_IP.hdf5") is True:
+        #    os.remove("eom_intermediates_IP.hdf5")
+
         eea,cea = run_ea_krccsd(cc, klist=[0])
         eea, cea = eea[0], cea[0]
         qpea = np.linalg.norm(cea[:nvir],axis=0)**2
@@ -66,6 +71,58 @@ def run_eom_krccsd_bands(cell, nmp, kpts_red):
         if rank == 0:
             filename = "kpt_%.4f_%.4f_%.4f-band.dat"%(kpt[0], kpt[1], kpt[2])
             f = open(filename,'w')
+            f.write("# IP\n")
+            for ekn, qpkn in zip(eip,qpip):
+                f.write("%0.6f %0.6f \n"%(ekn, qpkn))
+            f.write("# EA \n")
+            for ekn, qpkn in zip(eea,qpea):
+                f.write("%0.6f %0.6f \n"%(ekn, qpkn))
+            f.write("\n")
+            f.close()
+        if np.max(-eip) > vbmax:
+            vbmax = np.max(-eip)
+        if np.min(eea) < cbmin:
+            cbmin = np.min(eea)
+
+        cc = None
+
+        if rank == 0:
+            if os.path.isfile("eris1.hdf5") is True:
+                os.remove("eris1.hdf5")
+            if os.path.isfile("__ip_dvdson__.hdf5") is True:
+                os.remove("__ip_dvdson__.hdf5")
+            if os.path.isfile("__ea_dvdson__.hdf5") is True:
+                os.remove("__ea_dvdson__.hdf5")
+                #shutil.rmtree('./tmp')
+        comm.Barrier()
+
+    for k, ek in enumerate(e_kn):
+        e_kn[k] = ek-vbmax
+    bandgap = cbmin - vbmax
+    return e_kn, qp_kn, bandgap
+
+def read_eom_krccsd_bands(cell, nmp, kpts_red):
+    from scf import run_khf
+    e_kn = []
+    qp_kn = []
+    vbmax = -99
+    cbmin = 99
+
+    for kpt in kpts_red:
+        eip,cip = run_ip_krccsd(cc, klist=[0])
+        eip, cip = eip[0], cip[0]
+        qpip = np.linalg.norm(cip[:nocc],axis=0)**2
+
+        eea,cea = run_ea_krccsd(cc, klist=[0])
+        eea, cea = eea[0], cea[0]
+        qpea = np.linalg.norm(cea[:nvir],axis=0)**2
+
+        e_kn.append( np.append(-eip[::-1], eea) )
+        qp_kn.append( np.append(qpip[::-1], qpea) )
+        if rank == 0:
+            filename = "kpt_%.4f_%.4f_%.4f-band.dat"%(kpt[0], kpt[1], kpt[2])
+            f = open(filename,'r')
+            lines = f.readlines()
             f.write("# IP\n")
             for ekn, qpkn in zip(eip,qpip):
                 f.write("%0.6f %0.6f \n"%(ekn, qpkn))

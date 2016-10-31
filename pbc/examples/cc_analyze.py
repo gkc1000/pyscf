@@ -18,46 +18,56 @@ def read_eom_krccsd_bands(cell, nmp, kpts_red):
     cbmin = 99
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
 
+    nip = 3
+    nea = 3
+
     for kpt in kpts_red:
         if rank == 0:
             filename = "kpt_%.4f_%.4f_%.4f-band.dat"%(kpt[0], kpt[1], kpt[2])
 
-            f = open(filename,"r")
-            lines = f.readlines()
-            lines = [lines[i].strip(' \n') for i in range(len(lines))]
-            lines = filter(None,lines)
-            comment_lines = [x.find('#') == -1 for x in lines]
-            # Finding beginning and end of IP values, ignoring comments
-            #
-            for pos,line in enumerate(comment_lines):
-                if line == True:
-                    IP_begin = pos
-                    break
-            for pos,line in enumerate(comment_lines[IP_begin:]):
-                if line == False:
-                    IP_end = IP_begin + pos
-                    break
-            # Finding beginning and end of EA values, ignoring comments
-            #
-            comment_lines = comment_lines[::-1]
-            for pos,line in enumerate(comment_lines):
-                if line == True:
-                    EA_end = pos
-                    break
-            print comment_lines
-            for pos,line in enumerate(comment_lines[EA_end:]):
-                if line == False:
-                    EA_begin = EA_end + pos
-                    break
-            EA_end = len(lines) - EA_end
-            EA_begin = len(lines) - EA_begin
-            IP_lines = lines[IP_begin:IP_end]
-            EA_lines = lines[EA_begin:EA_end]
-            print "IP lines ", lines[IP_begin:IP_end]
-            print "EA lines ", lines[EA_begin:EA_end]
+            if os.path.isfile(filename):
+                f = open(filename,"r")
+                lines = f.readlines()
+                lines = [lines[i].strip(' \n') for i in range(len(lines))]
+                lines = filter(None,lines)
+                comment_lines = [x.find('#') == -1 for x in lines]
+                # Finding beginning and end of IP values, ignoring comments
+                #
+                for pos,line in enumerate(comment_lines):
+                    if line == True:
+                        IP_begin = pos
+                        break
+                for pos,line in enumerate(comment_lines[IP_begin:]):
+                    if line == False:
+                        IP_end = IP_begin + pos
+                        break
+                # Finding beginning and end of EA values, ignoring comments
+                #
+                comment_lines = comment_lines[::-1]
+                for pos,line in enumerate(comment_lines):
+                    if line == True:
+                        EA_end = pos
+                        break
+                print comment_lines
+                for pos,line in enumerate(comment_lines[EA_end:]):
+                    if line == False:
+                        EA_begin = EA_end + pos
+                        break
+                EA_end = len(lines) - EA_end
+                EA_begin = len(lines) - EA_begin
+                IP_lines = lines[IP_begin:IP_end]
+                EA_lines = lines[EA_begin:EA_end]
+                print "IP lines ", lines[IP_begin:IP_end]
+                print "EA lines ", lines[EA_begin:EA_end]
 
-            IP_lines = np.array([x.split() for x in IP_lines])
-            EA_lines = np.array([x.split() for x in EA_lines])
+                IP_lines = np.array([x.split() for x in IP_lines])
+                EA_lines = np.array([x.split() for x in EA_lines])
+
+            else:
+                IP_lines = np.ones((nip,2))*999.9
+                IP_lines[:,1] *= 0.0
+                EA_lines = np.ones((nea,2))*999.9
+                EA_lines[:,1] *= 0.0
 
             eip  = np.array(IP_lines[:,0], dtype=float)
             qpip = np.array(IP_lines[:,1], dtype=float)

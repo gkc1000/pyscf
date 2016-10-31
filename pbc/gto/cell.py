@@ -173,6 +173,7 @@ class Cell(pyscf.gto.Mole):
         self.h = None # lattice vectors, three *columns*: array((a1,a2,a3))
         self.gs = None
         self.precision = 1.e-8
+	self.dimension = 3
         self.nimgs = None
         self.ew_eta = None
         self.ew_cut = None

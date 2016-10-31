@@ -10,6 +10,7 @@ import numpy as np
 import scipy.linalg
 import scipy.optimize
 import pyscf
+from pyscf.pbc import tools
 import pyscf.lib.parameters as param
 from pyscf import lib
 import pyscf.gto.mole
@@ -173,7 +174,6 @@ class Cell(pyscf.gto.Mole):
         self.h = None # lattice vectors, three *columns*: array((a1,a2,a3))
         self.gs = None
         self.precision = 1.e-8
-	self.dimension = 3
         self.nimgs = None
         self.ew_eta = None
         self.ew_cut = None
@@ -185,7 +185,8 @@ class Cell(pyscf.gto.Mole):
 # don't modify the following variables, they are not input arguments
         self.Gv = None
         self.vol = None
-        self._h = None 
+        self._h = None
+        self.dimension = 3
         self._pseudo = None
         self._keys = set(self.__dict__.keys())
 
@@ -316,9 +317,9 @@ class Cell(pyscf.gto.Mole):
             ew_eta, ew_cut : float
                 The Ewald 'eta' and 'cut' parameters.
         '''
-        #  See Martin, p. 85 
+        #  See Martin, p. 85
         _h = self.lattice_vectors()
-        Gmax = min([ 2.*np.pi*self.gs[i]/lib.norm(_h[i,:]) for i in range(3) ])
+        Gmax = min([ 2.*np.pi*max(self.gs[i],1)/lib.norm(_h[i,:]) for i in range(3) ])
 
         log_precision = np.log(precision)
         ew_eta = np.sqrt(-Gmax**2/(4*log_precision))
@@ -327,8 +328,18 @@ class Cell(pyscf.gto.Mole):
         ew_cut = self.get_bounding_sphere(rcut)
         return ew_eta, ew_cut
 
+
+    def get_scaled_kpts(self, abs_kpts):
+        '''Get scaled k-points, given absolute k-points in 1/Bohr.
+        Args:
+            abs_kpts : (nkpts, 3) ndarray of floats
+        Returns:
+            scaled_kpts : (nkpts, 3) ndarray of floats
+        '''
+        return 1./(2*np.pi)*np.dot(abs_kpts, self._h)
+
     def get_bounding_sphere(self, rcut):
-        '''Finds all the lattice points within a sphere of radius rcut.  
+        '''Finds all the lattice points within a sphere of radius rcut.
 
         Defines a parallelipiped given by -N_x <= n_x <= N_x, with x in [1,3]
         See Martin p. 85
@@ -405,7 +416,7 @@ class Cell(pyscf.gto.Mole):
             scaled_kpts : (nkpts, 3) ndarray of floats
 
         Returns:
-            abs_kpts : (nkpts, 3) ndarray of floats 
+            abs_kpts : (nkpts, 3) ndarray of floats
         '''
         # inv_h has reciprocal vectors as rows
         return 2*np.pi*np.dot(scaled_kpts, scipy.linalg.inv(self._h))

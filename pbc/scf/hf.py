@@ -373,12 +373,23 @@ def ewald(cell, ew_eta, ew_cut, verbose=logger.NOTE):
     #else:
     #    log = logger.Logger(cell.stdout, verbose)
 
+    if cell.dimension == 1:
+	raise NotImplementedError
+
     chargs = [cell.atom_charge(i) for i in range(len(cell._atm))]
     coords = [cell.atom_coord(i) for i in range(len(cell._atm))]
 
     ewovrl = 0.
 
     # set up real-space lattice indices [-ewcut ... ewcut]
+    height = cell._h[2,2]
+    # For 2D we don't sum in the z-direction
+    if cell.dimension == 2:
+        ew_cut[2] = 0
+    if cell.dimension == 1:
+        ew_cut[0] = 0
+        ew_cut[1] = 0
+
     ewxrange = range(-ew_cut[0],ew_cut[0]+1)
     ewyrange = range(-ew_cut[1],ew_cut[1]+1)
     ewzrange = range(-ew_cut[2],ew_cut[2]+1)
@@ -416,31 +427,91 @@ def ewald(cell, ew_eta, ew_cut, verbose=logger.NOTE):
 
     # last line of Eq. (F.5) in Martin
     ewself  = -1./2. * np.dot(chargs,chargs) * 2 * ew_eta / np.sqrt(np.pi)
-    ewself += -1./2. * np.sum(chargs)**2 * np.pi/(ew_eta**2 * cell.vol)
+    if cell.dimension == 1:
+        # This is taken care of already in the reciprocal space sum
+        ewself += 0.0
+    elif cell.dimension == 2:
+        # This is taken care of already in the reciprocal space sum
+        ewself += 0.0
+    else:
+        ewself += -1./2. * np.sum(chargs)**2 * np.pi/(ew_eta**2 * cell.vol)
 
-    # g-space sum (using g grid) (Eq. (F.6) in Martin, but note errors as below)
-    SI = cell.get_SI()
-    ZSI = np.einsum("i,ij->j", chargs, SI)
+    if cell.dimension == 1:
+        # We only want the Gvectors to span a 1D space, so we keep all G where Gx, Gy = 0.0
+        Gvecs = cell.Gv[np.where(abs(cell.Gv[:,0])+abs(cell.Gv[:,1]) < 1e-14)]
 
-    # Eq. (F.6) in Martin is off by a factor of 2, the
-    # exponent is wrong (8->4) and the square is in the wrong place
-    #
-    # Formula should be
-    #   1/2 * 4\pi / Omega \sum_I \sum_{G\neq 0} |ZS_I(G)|^2 \exp[-|G|^2/4\eta^2]
-    # where
-    #   ZS_I(G) = \sum_a Z_a exp (i G.R_a)
-    # See also Eq. (32) of ewald.pdf at
-    #   http://www.fisica.uniud.it/~giannozz/public/ewald.pdf
+        rij    = np.array([i-j for i in coords for j in coords])     # r_ij = r_i - r_j
+        absrij = np.sqrt(np.einsum('ij,ij->i',rij[:,:2],rij[:,:2]))
+        c1f = conv1D.conv1Dfunc(ew_eta, Gvecs, absrij, smoothing=False)
+        chargij = np.array([i*j for i in chargs for j in chargs]) # N_ij = N_i * N_j
+        Gz = Gvecs[:,2]
+        gnGij = np.empty((len(Gz),len(rij)),dtype=float)  # g(G,z_ij)
 
-    coulG = tools.get_coulG(cell)
-    absG2 = np.einsum('gi,gi->g', cell.Gv, cell.Gv)
+        # we fill in all the g(G,z_ij) terms (eq. A11 of "Ideal Regularization" by Sundararaman and Arias)
+        for ig in range(gnGij.shape[0]):
+            cgz = Gz[ig]
+            gnGij[ig,:] = c1f.getCmatrixAtGz(cgz,absrij)
 
-    ZSIG2 = np.abs(ZSI)**2
-    expG2 = np.exp(-absG2/(4*ew_eta**2))
-    JexpG2 = coulG*expG2
-    ewgI = np.dot(ZSIG2,JexpG2)
-    ewg = .5*np.sum(ewgI)
-    ewg /= cell.vol
+        # now getting the structure-like factor, S(G,r_ij) = e^(i r_ij G ) * N_ij
+        tmp = np.exp(-1j*np.dot(rij, Gvecs.T)).T * chargij # gives shape (ng,len(r_ij))
+        ewg = 0.5 * np.dot( gnGij.flatten(), tmp.flatten() )
+        ewg /= height
+
+    elif cell.dimension == 2:
+        # We only want the Gvectors to span a 2D space, so we get rid of all Gz != 0
+        Gvecs = cell.Gv[np.where(abs(cell.Gv[:,2]) < 1e-14)]
+
+        # This is gn for |G| != 0
+        def gn(G,z):
+            Gd2e = G / 2. / ew_eta
+            val = np.pi / G * ( np.exp( G*z) * scipy.special.erfc( Gd2e + ew_eta*z ) +
+                                np.exp(-G*z) * scipy.special.erfc( Gd2e - ew_eta*z ) )
+            return val
+
+        rij = np.array([i-j for i in coords for j in coords])     # r_ij = r_i - r_j
+        chargij = np.array([i*j for i in chargs for j in chargs]) # N_ij = N_i * N_j
+        zij = rij[:,2] #z_ij
+        absG = np.sqrt(np.einsum('gi,gi->g', Gvecs, Gvecs)) # |G|
+        gnGij = np.empty((len(absG),len(zij)),dtype=float)  # g(G,z_ij)
+
+        # we fill in all the g(G,z_ij) terms (eq. A11 of "Ideal Regularization" by Sundararaman and Arias)
+        for ig in range(gnGij.shape[0]):
+            gvec = absG[ig]
+            if gvec < 1e-12:
+                gnGij[ig,:] = -2.*np.pi*( zij*scipy.special.erf(ew_eta*zij) +
+                                          np.exp(-ew_eta**2 * zij**2) / (ew_eta*np.sqrt(np.pi)))
+            else:
+                gnGij[ig,:] = gn(gvec,zij)
+
+        # now getting the structure-like factor, S(G,r_ij) = e^(i r_ij G ) * N_ij
+        tmp = np.exp(-1j*np.dot(rij, Gvecs.T)).T * chargij # gives shape (ng,len(r_ij))
+        ewg = 0.5 * np.dot( gnGij.flatten(), tmp.flatten() )
+        ewg /= (cell.vol/height)
+
+    else:
+        # g-space sum (using g grid) (Eq. (F.6) in Martin, but note errors as below)
+        SI = cell.get_SI()
+        ZSI = np.einsum("i,ij->j", chargs, SI)
+
+        # Eq. (F.6) in Martin is off by a factor of 2, the
+        # exponent is wrong (8->4) and the square is in the wrong place
+        #
+        # Formula should be
+        #   1/2 * 4\pi / Omega \sum_I \sum_{G\neq 0} |ZS_I(G)|^2 \exp[-|G|^2/4\eta^2]
+        # where
+        #   ZS_I(G) = \sum_a Z_a exp (i G.R_a)
+        # See also Eq. (32) of ewald.pdf at
+        #   http://www.fisica.uniud.it/~giannozz/public/ewald.pdf
+
+        coulG = tools.get_coulG(cell)
+        absG2 = np.einsum('gi,gi->g', cell.Gv, cell.Gv)
+
+        ZSIG2 = np.abs(ZSI)**2
+        expG2 = np.exp(-absG2/(4*ew_eta**2))
+        JexpG2 = coulG*expG2
+        ewgI = np.dot(ZSIG2,JexpG2)
+        ewg = .5*np.sum(ewgI)
+        ewg /= cell.vol
 
     #log.debug('Ewald components = %.15g, %.15g, %.15g', ewovrl, ewself, ewg)
     return ewovrl + ewself + ewg

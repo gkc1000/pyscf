@@ -1415,6 +1415,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
 
         return evals.real, evecs
 
+    @profile
     def ipccsd_pt2(self, ipccsd_evals, ipccsd_evecs, lipccsd_evecs):
         nocc = self.nocc()
         nvir = self.nmo() - nocc
@@ -1429,22 +1430,20 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         for _eval, _evec, _levec in zip(ipccsd_evals, ipccsd_evecs.T, lipccsd_evecs.T):
             l1,l2 = self.vector_to_amplitudes_ip(_levec)
             r1,r2 = self.vector_to_amplitudes_ip(_evec)
-            ldotr = numpy.dot(l1.conj(),r1) + numpy.dot(l2.ravel().conj(),r2.ravel())
+            #ldotr = numpy.dot(l1.ravel().conj(),r1.ravel()) + numpy.dot(l2.ravel().conj(),r2.ravel())
+            ldotr = numpy.dot(l1.ravel(),r1.ravel()) + numpy.dot(l2.ravel(),r2.ravel())
+            print "ldotr = ", ldotr
             l1 /= ldotr
             l2 /= ldotr
             l1 = l1.reshape(-1)
             r1 = r1.reshape(-1)
 
-            # Here we have that 'ki' is fixed from momentum conservation, and 'ka' is fixed
-            # from the fact that the L2's and R2's that make up the expression have one index
-            # fixed from momentum conservation
-            lijkab  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nkpts,nocc,nocc,nocc,nvir,nvir),dtype=t2.dtype)
-            plijkab = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nkpts,nocc,nocc,nocc,nvir,nvir),dtype=t2.dtype)
-            rijkab  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nkpts,nocc,nocc,nocc,nvir,nvir),dtype=t2.dtype)
+            lijkab_tmp = numpy.zeros((nocc,nocc,nocc,nvir,nvir),dtype=t2.dtype)
+            rijkab_tmp = numpy.zeros((nocc,nocc,nocc,nvir,nvir),dtype=t2.dtype)
             def mem_usage_oookk(nocc, nvir, nkpts):
                 return nocc**3 * nkpts * 16
             array_size = [nkpts,nkpts]
-            chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oookk(nkpts,nocc,nvir),
+            chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oookk(nocc,nvir,nkpts),
                                                     array_size, priority_list=[1,1])
             task_list = generate_task_list(chunk_size,array_size)
 
@@ -1453,6 +1452,8 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             for kirange, kjrange in mpi.work_stealing_partition(task_list):
                 oovv_ijX = _cp(eris.oovv[slice(*kirange),slice(*kjrange),range(nkpts)])
                 oovv_jiX = _cp(eris.oovv[slice(*kjrange),slice(*kirange),range(nkpts)])
+
+                kklist = tools.get_kconserv3(self._scf.cell, self._kpts, [range(nkpts),range(nkpts),kshift,range(*kirange),range(*kjrange)])
 
                 for iterki, ki in enumerate(range(*kirange)):
                     for iterkj, kj in enumerate(range(*kjrange)):
@@ -1465,265 +1466,274 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                             ##########################################
 
                             for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
+                                if ka > kb:
+                                    continue
+                                fac = (2.0 - float(ka==kb))
 
-                                    #kb = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kk,ka,kshift])
+                                if ka == kb:
+                                    if ki > kj:
+                                        continue
+                                    else:
+                                        fac *= (2.0 - float(ki==kj))
 
-                                    if kk == kshift:
-                                        # (i,j,k) -> (i,j,k)
-                                        if kb == tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kk,ka,kshift]):
-                                            tmp = 0.5*einsum('ijab,k->ijkab',oovv_ijX[iterki,iterkj,iterka],l1)
-                                            lijkab[ki,kj,kk,ka,kb] += 4.* tmp
+                                lijkab_tmp *= 0.0
+                                rijkab_tmp *= 0.0
+                                kk = kklist[ka,kb,iterki,iterkj]
 
-                                            tmp = 0.5*einsum('jiba,k->ijkab',oovv_jiX[iterkj,iterki,kb],l1)
-                                            lijkab[ki,kj,kk,ka,kb] += 4.* tmp
+                                # (i,j,k) -> (i,j,k)
+                                if kk == kshift and kb == kconserv[ki,ka,kj]:
+                                    tmp = 0.5*einsum('ijab,k->ijkab',oovv_ijX[iterki,iterkj,iterka],l1)
+                                    lijkab_tmp += 8.* tmp
 
-                                        if kb == kconserv[ki,ka,kj]:
-                                            # (j,i,k) -> (i,j,k)
-                                            tmp = 0.5*einsum('jiab,k->ijkab',oovv_jiX[iterkj,iterki,ka],l1)
-                                            lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
+                                    #tmp = 0.5*einsum('jiba,k->ijkab',oovv_jiX[iterkj,iterki,kb],l1)
+                                    #lijkab_tmp += 4.* tmp
 
-                                            # (j,i,k) -> (i,j,k)
-                                            tmp = 0.5*einsum('ijba,k->ijkab',oovv_ijX[iterki,iterkj,kb],l1)
-                                            lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
-
-                                    # (k,j,i) -> (i,j,k)
-                                    if ki == kshift and kb == kconserv[kj,ka,kk]:
-                                        tmp = 0.5*einsum('kjab,i->ijkab',eris.oovv[kk,kj,ka],l1)
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
-
-                                    if kj == kshift and kb == kconserv[ki,ka,kk]:
-                                        tmp = 0.5*einsum('kiba,j->ijkab',eris.oovv[kk,ki,kb],l1)
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
-
-                                    # (i,k,j) -> (i,j,k)
-                                    if kj == kshift and kb == kconserv[ki,ka,kk]:
-                                        tmp = 0.5*einsum('ikab,j->ijkab',eris.oovv[ki,kk,ka],l1)
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
-
-                                    if ki == kshift and kb == kconserv[kj,ka,kk]:
-                                        tmp = 0.5*einsum('jkba,i->ijkab',eris.oovv[kj,kk,kb],l1)
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.* tmp
-
-                                    # (j,k,i) -> (i,j,k)
-                                    if kj == kshift and kb == kconserv[ki,ka,kk]:
-                                        tmp = 0.5*einsum('kiab,j->ijkab',eris.oovv[kk,ki,ka],l1)
-                                        lijkab[ki,kj,kk,ka,kb] += 1.* tmp
-
-                                    if ki == kshift and kb == kconserv[kj,ka,kk]:
-                                        tmp = 0.5*einsum('kjba,i->ijkab',eris.oovv[kk,kj,kb],l1)
-                                        lijkab[ki,kj,kk,ka,kb] += 1.* tmp
-
-                                    # (k,i,j) -> (i,j,k)
-                                    if ki == kshift and kb == kconserv[kj,ka,kk]:
-                                        tmp = 0.5*einsum('jkab,i->ijkab',eris.oovv[kj,kk,ka],l1)
-                                        lijkab[ki,kj,kk,ka,kb] += 1.* tmp
-
-                                    if kj == kshift and kb == kconserv[ki,ka,kk]:
-                                        tmp = 0.5*einsum('ikba,j->ijkab',eris.oovv[ki,kk,kb],l1)
-                                        lijkab[ki,kj,kk,ka,kb] += 1.* tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    ke = kconserv[ka,ki,kb]
-                                    if kk == kconserv[kshift,kj,ke]:
-                                        tmp = 1./3*einsum('ieab,jke->ijkab',eris.ovvv[ki,ke,ka],l2[kj,kk] + 2.*l2[kk,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
-
-                                    ke = kconserv[ka,kj,kb]
-                                    if kk == kconserv[kshift,ki,ke]:
-                                        tmp = 1./3*einsum('jeba,ike->ijkab',eris.ovvv[kj,ke,kb],l2[ki,kk] + 2.*l2[kk,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
+                                if kk == kshift and kb == kconserv[ki,ka,kj]:
+                                    # (j,i,k) -> (i,j,k)
+                                    tmp = 0.5*einsum('jiab,k->ijkab',oovv_jiX[iterkj,iterki,ka],l1)
+                                    lijkab_tmp -= 4.* tmp
 
                                     # (j,i,k) -> (i,j,k)
-                                    ke = kconserv[ka,kj,kb]
-                                    if kk == kconserv[kshift,ki,ke]:
-                                        tmp = 1./3*einsum('jeab,ike->ijkab',eris.ovvv[kj,ke,ka],l2[ki,kk] + 2.*l2[kk,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                    #tmp = 0.5*einsum('ijba,k->ijkab',oovv_ijX[iterki,iterkj,kb],l1)
+                                    #lijkab_tmp -= 2.* tmp
 
-                                    ke = kconserv[ka,ki,kb]
-                                    if kk == kconserv[kshift,kj,ke]:
-                                        tmp = 1./3*einsum('ieba,jke->ijkab',eris.ovvv[ki,ke,kb],l2[kj,kk] + 2.*l2[kk,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (k,j,i) -> (i,j,k)
+                                if ki == kshift and kb == kconserv[kj,ka,kk]:
+                                    tmp = 0.5*einsum('kjab,i->ijkab',eris.oovv[kk,kj,ka],l1)
+                                    lijkab_tmp -= 4.* tmp
 
-                                    # (k,j,i) -> (i,j,k)
-                                    ke = kconserv[ki,kshift,kj]
-                                    if kk == kconserv[kb,ke,ka]:
-                                        tmp = 1./3*einsum('keab,jie->ijkab',eris.ovvv[kk,ke,ka],l2[kj,ki] + 2.*l2[ki,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                #if kj == kshift and kb == kconserv[ki,ka,kk]:
+                                #    tmp = 0.5*einsum('kiba,j->ijkab',eris.oovv[kk,ki,kb],l1)
+                                #    lijkab_tmp -= 2.* tmp
 
-                                    ke = kconserv[ka,kj,kb]
-                                    if kk == kconserv[kshift,ki,ke]:
-                                        tmp = 1./3*einsum('jeba,kie->ijkab',eris.ovvv[kj,ke,kb],l2[kk,ki] + 2.*l2[ki,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (i,k,j) -> (i,j,k)
+                                if kj == kshift and kb == kconserv[ki,ka,kk]:
+                                    tmp = 0.5*einsum('ikab,j->ijkab',eris.oovv[ki,kk,ka],l1)
+                                    lijkab_tmp -= 4.* tmp
 
-                                    # (i,k,j) -> (i,j,k)
-                                    ke = kconserv[ka,ki,kb]
-                                    if kk == kconserv[kshift,kj,ke]:
-                                        tmp = 1./3*einsum('ieab,kje->ijkab',eris.ovvv[ki,ke,ka],l2[kk,kj] + 2.*l2[kj,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                #if ki == kshift and kb == kconserv[kj,ka,kk]:
+                                #    tmp = 0.5*einsum('jkba,i->ijkab',eris.oovv[kj,kk,kb],l1)
+                                #    lijkab_tmp -= 2.* tmp
 
-                                    ke = kconserv[ki,kshift,kj]
-                                    if kk == kconserv[ka,ke,kb]:
-                                        tmp = 1./3*einsum('keba,ije->ijkab',eris.ovvv[kk,ke,kb],l2[ki,kj] + 2.*l2[kj,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (j,k,i) -> (i,j,k)
+                                if kj == kshift and kb == kconserv[ki,ka,kk]:
+                                    tmp = 0.5*einsum('kiab,j->ijkab',eris.oovv[kk,ki,ka],l1)
+                                    lijkab_tmp += 2.* tmp
 
-                                    # (j,k,i) -> (i,j,k)
-                                    ke = kconserv[ki,kshift,kj]
-                                    if kk == kconserv[ka,ke,kb]:
-                                        tmp = 1./3*einsum('keab,ije->ijkab',eris.ovvv[kk,ke,ka],l2[ki,kj] + 2.*l2[kj,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                #if ki == kshift and kb == kconserv[kj,ka,kk]:
+                                #    tmp = 0.5*einsum('kjba,i->ijkab',eris.oovv[kk,kj,kb],l1)
+                                #    lijkab_tmp += 1.* tmp
 
-                                    ke = kconserv[ka,ki,kb]
-                                    if kk == kconserv[kshift,kj,ke]:
-                                        tmp = 1./3*einsum('ieba,kje->ijkab',eris.ovvv[ki,ke,kb],l2[kk,kj] + 2.*l2[kj,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                # (k,i,j) -> (i,j,k)
+                                if ki == kshift and kb == kconserv[kj,ka,kk]:
+                                    tmp = 0.5*einsum('jkab,i->ijkab',eris.oovv[kj,kk,ka],l1)
+                                    lijkab_tmp += 2.* tmp
 
-                                    # (k,i,j) -> (i,j,k)
-                                    ke = kconserv[ka,kj,kb]
-                                    if kk == kconserv[kshift,ki,ke]:
-                                        tmp = 1./3*einsum('jeab,kie->ijkab',eris.ovvv[kj,ke,ka],l2[kk,ki] + 2.*l2[ki,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
-
-                                    ke = kconserv[kj,kshift,ki]
-                                    if kk == kconserv[ka,ke,kb]:
-                                        tmp = 1./3*einsum('keba,jie->ijkab',eris.ovvv[kk,ke,kb],l2[kj,ki] + 2.*l2[ki,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                #if kj == kshift and kb == kconserv[ki,ka,kk]:
+                                #    tmp = 0.5*einsum('ikba,j->ijkab',eris.oovv[ki,kk,kb],l1)
+                                #    lijkab_tmp += 1.* tmp
 
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    km = kconserv[kshift,ki,ka]
-                                    if kk == kconserv[kb,kj,km]:
-                                        tmp = -1./3*einsum('kjmb,ima->ijkab',eris.ooov[kk,kj,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
+                                # Beginning of ovvv terms
 
-                                    km = kconserv[kshift,kj,kb]
-                                    if kk == kconserv[ka,ki,km]:
-                                        tmp = -1./3*einsum('kima,jmb->ijkab',eris.ooov[kk,ki,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
+                                ke = kconserv[ka,ki,kb]
+                                #if kk == kconserv[kshift,kj,ke]:
+                                tmp = 1./3*einsum('ieab,jke->ijkab',eris.ovvv[ki,ke,ka],l2[kj,kk] + 2.*l2[kk,kj].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
 
-                                    # (j,i,k) -> (i,j,k)
-                                    km = kconserv[kshift,kj,ka]
-                                    if kk == kconserv[kb,ki,km]:
-                                        tmp = -1./3*einsum('kimb,jma->ijkab',eris.ooov[kk,ki,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                ke = kconserv[ka,kj,kb]
+                                #if kk == kconserv[kshift,ki,ke]:
+                                tmp = 1./3*einsum('jeba,ike->ijkab',eris.ovvv[kj,ke,kb],l2[ki,kk] + 2.*l2[kk,ki].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
 
-                                    km = kconserv[kshift,ki,kb]
-                                    if kk == kconserv[ka,kj,km]:
-                                        tmp = -1./3*einsum('kjma,imb->ijkab',eris.ooov[kk,kj,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (j,i,k) -> (i,j,k)
+                                ke = kconserv[ka,kj,kb]
+                                #if kk == kconserv[kshift,ki,ke]:
+                                tmp = 1./3*einsum('jeab,ike->ijkab',eris.ovvv[kj,ke,ka],l2[ki,kk] + 2.*l2[kk,ki].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    # (k,j,i) -> (i,j,k)
-                                    km = kconserv[ki,kb,kj]
-                                    if kk == kconserv[kshift,km,ka]:
-                                        tmp = -1./3*einsum('ijmb,kma->ijkab',eris.ooov[ki,kj,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                ke = kconserv[ka,ki,kb]
+                                #if kk == kconserv[kshift,kj,ke]:
+                                tmp = 1./3*einsum('ieba,jke->ijkab',eris.ovvv[ki,ke,kb],l2[kj,kk] + 2.*l2[kk,kj].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[kshift,kj,kb]
-                                    if kk == kconserv[ka,ki,km]:
-                                        tmp = -1./3*einsum('ikma,jmb->ijkab',eris.ooov[ki,kk,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (k,j,i) -> (i,j,k)
+                                ke = kconserv[ki,kshift,kj]
+                                #if kk == kconserv[kb,ke,ka]:
+                                tmp = 1./3*einsum('keab,jie->ijkab',eris.ovvv[kk,ke,ka],l2[kj,ki] + 2.*l2[ki,kj].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    # (i,k,j) -> (i,j,k)
-                                    km = kconserv[kshift,ki,ka]
-                                    if kk == kconserv[km,kj,kb]:
-                                        tmp = -1./3*einsum('jkmb,ima->ijkab',eris.ooov[kj,kk,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                ke = kconserv[ka,kj,kb]
+                                #if kk == kconserv[kshift,ki,ke]:
+                                tmp = 1./3*einsum('jeba,kie->ijkab',eris.ovvv[kj,ke,kb],l2[kk,ki] + 2.*l2[ki,kk].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[ki,ka,kj]
-                                    if kk == kconserv[kshift,km,kb]:
-                                        tmp = -1./3*einsum('jima,kmb->ijkab',eris.ooov[kj,ki,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (i,k,j) -> (i,j,k)
+                                ke = kconserv[ka,ki,kb]
+                                #if kk == kconserv[kshift,kj,ke]:
+                                tmp = 1./3*einsum('ieab,kje->ijkab',eris.ovvv[ki,ke,ka],l2[kk,kj] + 2.*l2[kj,kk].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    # (j,k,i) -> (i,j,k)
-                                    km = kconserv[kj,kb,ki]
-                                    if kk == kconserv[kshift,km,ka]:
-                                        tmp = -1./3*einsum('jimb,kma->ijkab',eris.ooov[kj,ki,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                ke = kconserv[ki,kshift,kj]
+                                #if kk == kconserv[ka,ke,kb]:
+                                tmp = 1./3*einsum('keba,ije->ijkab',eris.ovvv[kk,ke,kb],l2[ki,kj] + 2.*l2[kj,ki].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[kshift,ki,kb]
-                                    if kk == kconserv[ka,kj,km]:
-                                        tmp = -1./3*einsum('jkma,imb->ijkab',eris.ooov[kj,kk,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                # (j,k,i) -> (i,j,k)
+                                ke = kconserv[ki,kshift,kj]
+                                #if kk == kconserv[ka,ke,kb]:
+                                tmp = 1./3*einsum('keab,ije->ijkab',eris.ovvv[kk,ke,ka],l2[ki,kj] + 2.*l2[kj,ki].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
 
-                                    # (k,i,j) -> (i,j,k)
-                                    km = kconserv[kshift,kj,ka]
-                                    if kk == kconserv[km,ki,kb]:
-                                        tmp = -1./3*einsum('ikmb,jma->ijkab',eris.ooov[ki,kk,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                ke = kconserv[ka,ki,kb]
+                                #if kk == kconserv[kshift,kj,ke]:
+                                tmp = 1./3*einsum('ieba,kje->ijkab',eris.ovvv[ki,ke,kb],l2[kk,kj] + 2.*l2[kj,kk].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
 
-                                    km = kconserv[ki,ka,kj]
-                                    if kk == kconserv[kshift,km,kb]:
-                                        tmp = -1./3*einsum('ijma,kmb->ijkab',eris.ooov[ki,kj,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                # (k,i,j) -> (i,j,k)
+                                ke = kconserv[ka,kj,kb]
+                                #if kk == kconserv[kshift,ki,ke]:
+                                tmp = 1./3*einsum('jeab,kie->ijkab',eris.ovvv[kj,ke,ka],l2[kk,ki] + 2.*l2[ki,kk].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    km = kconserv[ki,kb,kj]
-                                    if kk == kconserv[kshift,km,ka]:
-                                        tmp = -1./3*einsum('ijmb,mka->ijkab',eris.ooov[ki,kj,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
+                                ke = kconserv[kj,kshift,ki]
+                                #if kk == kconserv[ka,ke,kb]:
+                                tmp = 1./3*einsum('keba,jie->ijkab',eris.ovvv[kk,ke,kb],l2[kj,ki] + 2.*l2[ki,kj].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
 
-                                    km = kconserv[kj,ka,ki]
-                                    if kk == kconserv[kshift,km,kb]:
-                                        tmp = -1./3*einsum('jima,mkb->ijkab',eris.ooov[kj,ki,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 4.*tmp
 
-                                    # (j,i,k) -> (i,j,k)
-                                    km = kconserv[ki,kb,kj]
-                                    if kk == kconserv[kshift,km,ka]:
-                                        tmp = -1./3*einsum('jimb,mka->ijkab',eris.ooov[kj,ki,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
 
-                                    km = kconserv[kj,ka,ki]
-                                    if kk == kconserv[kshift,km,kb]:
-                                        tmp = -1./3*einsum('ijma,mkb->ijkab',eris.ooov[ki,kj,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # Beginning of ooov terms
 
-                                    # (k,j,i) -> (i,j,k)
-                                    km = kconserv[kshift,ki,ka]
-                                    if kk == kconserv[kb,kj,km]:
-                                        tmp = -1./3*einsum('kjmb,mia->ijkab',eris.ooov[kk,kj,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                km = kconserv[kshift,ki,ka]
+                                #if kk == kconserv[kb,kj,km]:
+                                tmp = -1./3*einsum('kjmb,ima->ijkab',eris.ooov[kk,kj,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
 
-                                    km = kconserv[kshift,ki,kb]
-                                    if kk == kconserv[ka,kj,km]:
-                                        tmp = -1./3*einsum('jkma,mib->ijkab',eris.ooov[kj,kk,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                km = kconserv[kshift,kj,kb]
+                                #if kk == kconserv[ka,ki,km]:
+                                tmp = -1./3*einsum('kima,jmb->ijkab',eris.ooov[kk,ki,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
 
-                                    # (i,k,j) -> (i,j,k)
-                                    km = kconserv[kshift,kj,ka]
-                                    if kk == kconserv[km,ki,kb]:
-                                        tmp = -1./3*einsum('ikmb,mja->ijkab',eris.ooov[ki,kk,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                # (j,i,k) -> (i,j,k)
+                                km = kconserv[kshift,kj,ka]
+                                #if kk == kconserv[kb,ki,km]:
+                                tmp = -1./3*einsum('kimb,jma->ijkab',eris.ooov[kk,ki,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[kshift,kj,kb]
-                                    if kk == kconserv[ka,ki,km]:
-                                        tmp = -1./3*einsum('kima,mjb->ijkab',eris.ooov[kk,ki,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] -= 2.*tmp
+                                km = kconserv[kshift,ki,kb]
+                                #if kk == kconserv[ka,kj,km]:
+                                tmp = -1./3*einsum('kjma,imb->ijkab',eris.ooov[kk,kj,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    # (j,k,i) -> (i,j,k)
-                                    km = kconserv[kshift,kj,ka]
-                                    if kk == kconserv[kb,ki,km]:
-                                        tmp = -1./3*einsum('kimb,mja->ijkab',eris.ooov[kk,ki,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                # (k,j,i) -> (i,j,k)
+                                km = kconserv[ki,kb,kj]
+                                #if kk == kconserv[kshift,km,ka]:
+                                tmp = -1./3*einsum('ijmb,kma->ijkab',eris.ooov[ki,kj,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[kshift,kj,kb]
-                                    if kk == kconserv[km,ki,ka]:
-                                        tmp = -1./3*einsum('ikma,mjb->ijkab',eris.ooov[ki,kk,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                km = kconserv[kshift,kj,kb]
+                                #if kk == kconserv[ka,ki,km]:
+                                tmp = -1./3*einsum('ikma,jmb->ijkab',eris.ooov[ki,kk,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    # (k,i,j) -> (i,j,k)
-                                    km = kconserv[kshift,ki,ka]
-                                    if kk == kconserv[kb,kj,km]:
-                                        tmp = -1./3*einsum('jkmb,mia->ijkab',eris.ooov[kj,kk,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                # (i,k,j) -> (i,j,k)
+                                km = kconserv[kshift,ki,ka]
+                                #if kk == kconserv[km,kj,kb]:
+                                tmp = -1./3*einsum('jkmb,ima->ijkab',eris.ooov[kj,kk,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
 
-                                    km = kconserv[kshift,ki,kb]
-                                    if kk == kconserv[ka,kj,km]:
-                                        tmp = -1./3*einsum('kjma,mib->ijkab',eris.ooov[kk,kj,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
-                                        lijkab[ki,kj,kk,ka,kb] += 1.*tmp
+                                km = kconserv[ki,ka,kj]
+                                #if kk == kconserv[kshift,km,kb]:
+                                tmp = -1./3*einsum('jima,kmb->ijkab',eris.ooov[kj,ki,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                # (j,k,i) -> (i,j,k)
+                                km = kconserv[kj,kb,ki]
+                                #if kk == kconserv[kshift,km,ka]:
+                                tmp = -1./3*einsum('jimb,kma->ijkab',eris.ooov[kj,ki,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                km = kconserv[kshift,ki,kb]
+                                #if kk == kconserv[ka,kj,km]:
+                                tmp = -1./3*einsum('jkma,imb->ijkab',eris.ooov[kj,kk,km],l2[ki,km] + 2.*l2[km,ki].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                # (k,i,j) -> (i,j,k)
+                                km = kconserv[kshift,kj,ka]
+                                #if kk == kconserv[km,ki,kb]:
+                                tmp = -1./3*einsum('ikmb,jma->ijkab',eris.ooov[ki,kk,km],l2[kj,km] + 2.*l2[km,kj].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                km = kconserv[ki,ka,kj]
+                                #if kk == kconserv[kshift,km,kb]:
+                                tmp = -1./3*einsum('ijma,kmb->ijkab',eris.ooov[ki,kj,km],l2[kk,km] + 2.*l2[km,kk].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                km = kconserv[ki,kb,kj]
+                                #if kk == kconserv[kshift,km,ka]:
+                                tmp = -1./3*einsum('ijmb,mka->ijkab',eris.ooov[ki,kj,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
+
+                                km = kconserv[kj,ka,ki]
+                                #if kk == kconserv[kshift,km,kb]:
+                                tmp = -1./3*einsum('jima,mkb->ijkab',eris.ooov[kj,ki,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
+                                lijkab_tmp += 4.*tmp
+
+                                # (j,i,k) -> (i,j,k)
+                                km = kconserv[ki,kb,kj]
+                                #if kk == kconserv[kshift,km,ka]:
+                                tmp = -1./3*einsum('jimb,mka->ijkab',eris.ooov[kj,ki,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                km = kconserv[kj,ka,ki]
+                                #if kk == kconserv[kshift,km,kb]:
+                                tmp = -1./3*einsum('ijma,mkb->ijkab',eris.ooov[ki,kj,km],l2[km,kk] + 2.*l2[kk,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                # (k,j,i) -> (i,j,k)
+                                km = kconserv[kshift,ki,ka]
+                                #if kk == kconserv[kb,kj,km]:
+                                tmp = -1./3*einsum('kjmb,mia->ijkab',eris.ooov[kk,kj,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                km = kconserv[kshift,ki,kb]
+                                #if kk == kconserv[ka,kj,km]:
+                                tmp = -1./3*einsum('jkma,mib->ijkab',eris.ooov[kj,kk,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                # (i,k,j) -> (i,j,k)
+                                km = kconserv[kshift,kj,ka]
+                                #if kk == kconserv[km,ki,kb]:
+                                tmp = -1./3*einsum('ikmb,mja->ijkab',eris.ooov[ki,kk,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                km = kconserv[kshift,kj,kb]
+                                #if kk == kconserv[ka,ki,km]:
+                                tmp = -1./3*einsum('kima,mjb->ijkab',eris.ooov[kk,ki,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
+                                lijkab_tmp -= 2.*tmp
+
+                                # (j,k,i) -> (i,j,k)
+                                km = kconserv[kshift,kj,ka]
+                                #if kk == kconserv[kb,ki,km]:
+                                tmp = -1./3*einsum('kimb,mja->ijkab',eris.ooov[kk,ki,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                km = kconserv[kshift,kj,kb]
+                                #if kk == kconserv[km,ki,ka]:
+                                tmp = -1./3*einsum('ikma,mjb->ijkab',eris.ooov[ki,kk,km],l2[km,kj] + 2.*l2[kj,km].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                # (k,i,j) -> (i,j,k)
+                                km = kconserv[kshift,ki,ka]
+                                #if kk == kconserv[kb,kj,km]:
+                                tmp = -1./3*einsum('jkmb,mia->ijkab',eris.ooov[kj,kk,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
+
+                                km = kconserv[kshift,ki,kb]
+                                #if kk == kconserv[ka,kj,km]:
+                                tmp = -1./3*einsum('kjma,mib->ijkab',eris.ooov[kk,kj,km],l2[km,ki] + 2.*l2[ki,km].transpose(1,0,2))
+                                lijkab_tmp += 1.*tmp
 
 
                             ##########################################
@@ -1732,98 +1742,90 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                             #                                        #
                             ##########################################
 
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                kk = kklist[ka,kb,iterki,iterkj]
                                 km = kshift
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    ke = kconserv[ki,ka,kj]
-                                    if kk == kconserv[kb,ke,km]:
-                                        tmp2 = -einsum('mbke,ijae,m->ijkab',eris.ovov[km,kb,kk],unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[ki,ka,kj]
+                                #if kk == kconserv[kb,ke,km]:
+                                tmp2 = -einsum('mbke,ijae,m->ijkab',eris.ovov[km,kb,kk],unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
+                                rijkab_tmp += tmp2
 
-                                    ke = kconserv[ki,kb,kj]
-                                    if kk == kconserv[ka,ke,km]:
-                                        tmp2 = -einsum('make,jibe,m->ijkab',eris.ovov[km,ka,kk],unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[ki,kb,kj]
+                                #if kk == kconserv[ka,ke,km]:
+                                tmp2 = -einsum('make,jibe,m->ijkab',eris.ovov[km,ka,kk],unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
+                                rijkab_tmp += tmp2
 
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                kk = kklist[ka,kb,iterki,iterkj]
                                 km = kshift
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    ke = kconserv[km,kj,kb]
-                                    if kk == kconserv[ka,ki,ke]:
-                                        tmp2 = -einsum('mbej,ikae,m->ijkab',eris.ovvo[km,kb,ke],unpack_tril(t2,nkpts,ki,kk,ka,kconserv[ki,ka,kk]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[km,kj,kb]
+                                #if kk == kconserv[ka,ki,ke]:
+                                tmp2 = -einsum('mbej,ikae,m->ijkab',eris.ovvo[km,kb,ke],unpack_tril(t2,nkpts,ki,kk,ka,kconserv[ki,ka,kk]),r1)
+                                rijkab_tmp += tmp2
 
-                                    ke = kconserv[km,ki,ka]
-                                    if kk == kconserv[kb,kj,ke]:
-                                        tmp2 = -einsum('maei,jkbe,m->ijkab',eris.ovvo[km,ka,ke],unpack_tril(t2,nkpts,kj,kk,kb,kconserv[kj,kb,kk]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[km,ki,ka]
+                                #if kk == kconserv[kb,kj,ke]:
+                                tmp2 = -einsum('maei,jkbe,m->ijkab',eris.ovvo[km,ka,ke],unpack_tril(t2,nkpts,kj,kk,kb,kconserv[kj,kb,kk]),r1)
+                                rijkab_tmp += tmp2
 
-                            for iterkb, kb in enumerate(range(nkpts)):
                                 kn = kshift
                                 # ki is free, kj is free, ka is free, kk is free
                                 # km, kb -> fixed
                                 # (i,j,k) -> (i,j,k)
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    km = kconserv[ka,ki,kb]
-                                    if kk == kconserv[km,kj,kn]:
-                                        tmp2 = einsum('mnjk,imab,n->ijkab',eris.oooo[km,kshift,kj],unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                kk = kklist[ka,kb,iterki,iterkj]
+                                km = kconserv[ka,ki,kb]
+                                #if kk == kconserv[km,kj,kn]:
+                                tmp2 = einsum('mnjk,imab,n->ijkab',eris.oooo[km,kshift,kj],unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                rijkab_tmp += tmp2
 
-                                    km = kconserv[kb,kj,ka]
-                                    if kk == kconserv[km,ki,kn]:
-                                        tmp2 = einsum('mnik,jmba,n->ijkab',eris.oooo[km,kshift,ki],unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                km = kconserv[kb,kj,ka]
+                                #if kk == kconserv[km,ki,kn]:
+                                tmp2 = einsum('mnik,jmba,n->ijkab',eris.oooo[km,kshift,ki],unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                rijkab_tmp += tmp2
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    ke = kconserv[ka,ki,kb]
-                                    if kk == kconserv[kshift,kj,ke]:
-                                        # Here we need vvov terms, but instead use ovvv.transpose(2,3,0,1).conj()
-                                        # terms, where the transpose was done in the einsum.
-                                        #
-                                        # See corresponding rccsd_eom equation
-                                        tmp2 = einsum('ieab,kje->ijkab',eris.ovvv[ki,ke,ka].conj(),r2[kk,kj])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[ka,ki,kb]
+                                #if kk == kconserv[kshift,kj,ke]:
+                                # Here we need vvov terms, but instead use ovvv.transpose(2,3,0,1).conj()
+                                # terms, where the transpose was done in the einsum.
+                                #
+                                # See corresponding rccsd_eom equation
+                                tmp2 = einsum('ieab,kje->ijkab',eris.ovvv[ki,ke,ka].conj(),r2[kk,kj])
+                                rijkab_tmp += tmp2
 
-                                    ke = kconserv[kb,kj,ka]
-                                    if kk == kconserv[kshift,ki,ke]:
-                                        tmp2 = einsum('jeba,kie->ijkab',eris.ovvv[kj,ke,kb].conj(),r2[kk,ki])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                ke = kconserv[kb,kj,ka]
+                                #if kk == kconserv[kshift,ki,ke]:
+                                tmp2 = einsum('jeba,kie->ijkab',eris.ovvv[kj,ke,kb].conj(),r2[kk,ki])
+                                rijkab_tmp += tmp2
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    km = kconserv[kshift,ki,ka]
-                                    if kk == kconserv[kb,kj,km]:
-                                        tmp2 = -einsum('kjmb,mia->ijkab',eris.ooov[kk,kj,km].conj(),r2[km,ki])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                km = kconserv[kshift,ki,ka]
+                                #if kk == kconserv[kb,kj,km]:
+                                tmp2 = -einsum('kjmb,mia->ijkab',eris.ooov[kk,kj,km].conj(),r2[km,ki])
+                                rijkab_tmp += tmp2
 
-                                    km = kconserv[kshift,kj,kb]
-                                    if kk == kconserv[ka,ki,km]:
-                                        tmp2 = -einsum('kima,mjb->ijkab',eris.ooov[kk,ki,km].conj(),r2[km,kj])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                km = kconserv[kshift,kj,kb]
+                                #if kk == kconserv[ka,ki,km]:
+                                tmp2 = -einsum('kima,mjb->ijkab',eris.ooov[kk,ki,km].conj(),r2[km,kj])
+                                rijkab_tmp += tmp2
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    km = kconserv[ki,kb,kj]
-                                    if kk == kconserv[kshift,km,ka]:
-                                        tmp2 = -einsum('mbij,kma->ijkab',eris.ovoo[km,kb,ki],r2[kk,km])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                km = kconserv[ki,kb,kj]
+                                #if kk == kconserv[kshift,km,ka]:
+                                tmp2 = -einsum('mbij,kma->ijkab',eris.ovoo[km,kb,ki],r2[kk,km])
+                                rijkab_tmp += tmp2
 
-                                    km = kconserv[kj,ka,ki]
-                                    if kk == kconserv[kshift,km,kb]:
-                                        tmp2 = -einsum('maji,kmb->ijkab',eris.ovoo[km,ka,kj],r2[kk,km])
-                                        rijkab[ki,kj,kk,ka,kb] += tmp2
+                                km = kconserv[kj,ka,ki]
+                                #if kk == kconserv[kshift,km,kb]:
+                                tmp2 = -einsum('maji,kmb->ijkab',eris.ovoo[km,ka,kj],r2[kk,km])
+                                rijkab_tmp += tmp2
 
-                            eia = numpy.diagonal(foo[ki]).reshape(-1,1) - numpy.diagonal(fvv[ka])
-                            eia += _eval
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                eia = numpy.diagonal(foo[ki]).reshape(-1,1) - numpy.diagonal(fvv[ka])
+                                eia += _eval
+
                                 ejb = numpy.diagonal(foo[kj]).reshape(-1,1) - numpy.diagonal(fvv[kb])
                                 eijab = pyscf.lib.direct_sum('ia,jb->ijab',eia,ejb)
-                                for iterkk, kk in enumerate(range(nkpts)):
-                                    eijkab = pyscf.lib.direct_sum('ijab,k->ijkab',eijab,numpy.diagonal(foo[kk]))
-                                    eijkab = 1./eijkab
 
-                                    pt2_energy += 0.5*einsum('ijkab,ijkab,ijkab',lijkab[ki,kj,kk,ka,kb].conj(),rijkab[ki,kj,kk,ka,kb],eijkab)
+                                eijkab = pyscf.lib.direct_sum('ijab,k->ijkab',eijab,numpy.diagonal(foo[kk]))
+                                eijkab = 1./eijkab
+
+                                #pt2_energy += 0.5*einsum('ijkab,ijkab,ijkab',lijkab_tmp.conj(),rijkab_tmp,eijkab)
+                                pt2_energy += fac*0.5*einsum('ijkab,ijkab,ijkab',lijkab_tmp,rijkab_tmp,eijkab)
 
 
             self.comm.Allreduce(MPI.IN_PLACE, pt2_energy, op=MPI.SUM)
@@ -2071,9 +2073,9 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         #       +    -einsum('bacj,jab->c',Wvvvo,r2)
         #       )
         def mem_usage_vvvo(nocc, nvir, nkpts):
-            return nocc**1 * nvir**3 * 16
+            return nocc**1 * nvir**3 * 16.
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_vvvo(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_vvvo(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2103,9 +2105,9 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                     Hr2[kl,kc] -= einsum('jcd,lj->lcd',r2[kl,kc],imds.Loo[kl])
 
         def mem_usage_voovk(nocc, nvir, nkpts):
-            return nocc**2 * nvir**2 * nkpts * 16
+            return nocc**2 * nvir**2 * nkpts * 16.
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_voovk(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_voovk(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2124,9 +2126,9 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                         Hr2[kl,kc] -=    einsum('jad,lajc->lcd',r2[kj,kb],WovovRev_jbX[iterkj,iterkb,kl])
 
         def mem_usage_vvvvk(nocc, nvir, nkpts):
-            return nocc**0 * nvir**4 * nkpts * 16
+            return nocc**0 * nvir**4 * nkpts * 16.
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_vvvvk(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_vvvvk(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2140,9 +2142,9 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                         Hr2[kl,kc] += einsum('lab,abcd->lcd',r2[kl,ka],Wvvvv_abX[iterka,iterkb,kc])
 
         def mem_usage_oovvk(nocc, nvir, nkpts):
-            return nocc**0 * nvir**4 * nkpts * 16
+            return nocc**2 * nvir**2 * nkpts * 16.
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oovvk(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oovvk(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2185,17 +2187,20 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         vector = self.amplitudes_to_vector_ea(Hr1,Hr2)
         return vector
 
+    @profile
     def eaccsd_pt2(self, eaccsd_evals, eaccsd_evecs, leaccsd_evecs):
         nocc = self.nocc()
+        nproc = self.comm.Get_size()
         nvir = self.nmo() - nocc
         nkpts = self.nkpts
         kconserv = self.kconserv
         eris = self.eris
         kshift = self.kshift
-        print kshift
         t1, t2 = self.t1, self.t2
         foo = eris.fock[:,:nocc,:nocc]
         fvv = eris.fock[:,nocc:,nocc:]
+
+        #kc = tools.get_kconserv3(self._scf.cell, self._kpts, [[0,1],[0,1],kshift,[0,1,2],[1,2]])
 
         for _eval, _evec, _levec in zip(eaccsd_evals, eaccsd_evecs.T, leaccsd_evecs.T):
             l1,l2 = self.vector_to_amplitudes_ea(_levec)
@@ -2224,7 +2229,8 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             r1 = r1.reshape(-1)
             print r1
             print l1
-            ldotr = numpy.dot(l1.conj(),r1) + numpy.dot((2.*l2_t-l2).ravel().conj(),r2_t.ravel())
+            #ldotr = numpy.dot(l1.conj(),r1) + numpy.dot((2.*l2_t-l2).ravel().conj(),r2_t.ravel())
+            ldotr = numpy.dot(l1,r1) + numpy.dot((2.*l2_t-l2).ravel(),r2_t.ravel())
             print ldotr
 
             # The transposed l2, r2 are the only 2ph operators needed for the rest of
@@ -2238,418 +2244,413 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             l1 /= ldotr
             l2 /= ldotr
 
-            lijabc  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
-            plijabc = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
-            rijabc  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
-            def mem_usage_oookk(nocc, nvir, nkpts):
-                return nocc**3 * nkpts * 16
+            #lijabc  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
+            #rijabc  = numpy.zeros((nkpts,nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
+            lijabc_tmp  = numpy.zeros((nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
+            rijabc_tmp  = numpy.zeros((nocc,nocc,nvir,nvir,nvir),dtype=t2.dtype)
+            def mem_usage_oovvk(nocc, nvir, nkpts):
+                return nocc**2 * nvir**2 * nkpts * 16
             array_size = [nkpts,nkpts]
-            chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oookk(nkpts,nocc,nvir),
+            # TODO: find a good blocksize for this...
+            chunk_size = get_max_blocksize_from_mem(0.3e9, 2.*mem_usage_oovvk(nocc,nvir,nkpts),
                                                     array_size, priority_list=[1,1])
+            max_chunk_size = tuple(nkpts//numpy.array([nproc,nproc]))
+            if max_chunk_size[0] < chunk_size[0]:
+                chunk_size = max_chunk_size
             task_list = generate_task_list(chunk_size,array_size)
 
             pt2_energy = numpy.array(0.0 + 1j*0.0)
 
+
             for kirange, kjrange in mpi.work_stealing_partition(task_list):
-                #oovv_jiX = _cp(eris.oovv[slice(*kjrange),slice(*kirange),range(nkpts)])
+                eris_oovv_jiX = _cp(eris.oovv[slice(*kjrange),slice(*kirange),range(nkpts)])
+                eris_oovv_ijX = _cp(eris.oovv[slice(*kirange),slice(*kjrange),range(nkpts)])
+
+                eris_ooov_jiX = _cp(eris.ooov[slice(*kjrange),slice(*kirange),range(nkpts)])
+                eris_ooov_ijX = _cp(eris.ooov[slice(*kirange),slice(*kjrange),range(nkpts)])
+
+                kclist = tools.get_kconserv3(self._scf.cell, self._kpts, [range(*kirange),range(*kjrange),kshift,range(nkpts),range(nkpts)])
 
                 for iterki, ki in enumerate(range(*kirange)):
                     for iterkj, kj in enumerate(range(*kjrange)):
+
+                        ##########################################
+                        #                                        #
+                        # Starting the left amplitude equations  #
+                        #                                        #
+                        ##########################################
+
                         for iterka, ka in enumerate(range(nkpts)):
-
-                            ##########################################
-                            #                                        #
-                            # Starting the left amplitude equations  #
-                            #                                        #
-                            ##########################################
-
                             for iterkb, kb in enumerate(range(nkpts)):
+                                if ka > kb:
+                                    continue
+                                kc = kclist[iterki,iterkj,ka,kb]
+                                fac = (2.0 - float(ka==kb))
 
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                if ka == kb:
+                                    if ki > kj:
+                                        continue
+                                    else:
+                                        fac *= (2.0 - float(ki==kj))
+
+                                lijabc_tmp *= 0.0
+                                rijabc_tmp *= 0.0
 
                                 #(a,b,c) -> (a,b,c)
                                 if kc == kshift and kb == kconserv[ki,ka,kj]:
-                                    tmp = -0.5*einsum('ijab,c->ijabc',eris.oovv[ki,kj,ka],l1)
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
-
-                                    tmp = -0.5*einsum('jiba,c->ijabc',eris.oovv[kj,ki,kb],l1)
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                    tmp = -0.5*einsum('ijab,c->ijabc',eris_oovv_ijX[iterki,iterkj,ka],l1)
+                                    lijabc_tmp += 8.*tmp
 
                                 #(b,a,c) -> (a,b,c)
                                 if kc == kshift and ka == kconserv[ki,kb,kj]:
-                                    tmp = -0.5*einsum('ijba,c->ijabc',eris.oovv[ki,kj,kb],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
-
-                                    tmp = -0.5*einsum('jiab,c->ijabc',eris.oovv[kj,ki,ka],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                    tmp = -0.5*einsum('ijba,c->ijabc',eris_oovv_ijX[iterki,iterkj,kb],l1)
+                                    lijabc_tmp += -4.* tmp
 
                                 #(c,b,a) -> (a,b,c)
                                 if ka == kshift and kb == kconserv[ki,kc,kj]:
-                                    tmp = -0.5*einsum('ijcb,a->ijabc',eris.oovv[ki,kj,kc],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                    tmp = -0.5*einsum('ijcb,a->ijabc',eris_oovv_ijX[iterki,iterkj,kc],l1)
+                                    lijabc_tmp += -4.* tmp
 
-                                    tmp = -0.5*einsum('jibc,a->ijabc',eris.oovv[kj,ki,kb],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                    #tmp = -0.5*einsum('jibc,a->ijabc',eris_oovv_jiX[iterkj,iterki,kb],l1)
+                                    #lijabc_tmp += -2.* tmp
 
                                 #(a,c,b) -> (a,b,c)
                                 if kb == kshift and kc == kconserv[ki,ka,kj]:
-                                    tmp = -0.5*einsum('ijac,b->ijabc',eris.oovv[ki,kj,ka],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                    tmp = -0.5*einsum('ijac,b->ijabc',eris_oovv_ijX[iterki,iterkj,ka],l1)
+                                    lijabc_tmp += -4.* tmp
 
-                                    tmp = -0.5*einsum('jica,b->ijabc',eris.oovv[kj,ki,kc],l1)
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                    #tmp = -0.5*einsum('jica,b->ijabc',eris_oovv_jiX[iterkj,iterki,kc],l1)
+                                    #lijabc_tmp += -2.* tmp
 
                                 #(b,c,a) -> (a,b,c)
                                 if kb == kshift and ka == kconserv[ki,kc,kj]:
-                                    tmp = -0.5*einsum('ijca,b->ijabc',eris.oovv[ki,kj,kc],l1)
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                    tmp = -0.5*einsum('ijca,b->ijabc',eris_oovv_ijX[iterki,iterkj,kc],l1)
+                                    lijabc_tmp += 2.* tmp
 
-                                    tmp = -0.5*einsum('jiac,b->ijabc',eris.oovv[kj,ki,ka],l1)
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                    #tmp = -0.5*einsum('jiac,b->ijabc',eris_oovv_jiX[iterkj,iterki,ka],l1)
+                                    #lijabc_tmp += 1.* tmp
 
                                 #(c,a,b) -> (a,b,c)
                                 if ka == kshift and kc == kconserv[ki,kb,kj]:
-                                    tmp = -0.5*einsum('ijbc,a->ijabc',eris.oovv[ki,kj,kb],l1)
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                    tmp = -0.5*einsum('ijbc,a->ijabc',eris_oovv_ijX[iterki,iterkj,kb],l1)
+                                    lijabc_tmp += 2.* tmp
 
-                                    tmp = -0.5*einsum('jicb,a->ijabc',eris.oovv[kj,ki,kc],l1)
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                    #tmp = -0.5*einsum('jicb,a->ijabc',eris_oovv_jiX[iterkj,iterki,kc],l1)
+                                    #lijabc_tmp += 1.* tmp
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                # end of oovv terms
 
                                 #(a,b,c) -> (a,b,c)
                                 km = kconserv[ki,ka,kj]
-                                if kb == kconserv[kshift,kc,km]:
-                                    tmp = einsum('jima,mbc->ijabc',eris.ooov[kj,ki,km],l2[km,kb])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                #if kc == kconserv[kshift,kb,km]:
+                                tmp = einsum('jima,mbc->ijabc',eris_ooov_jiX[iterkj,iterki,km],2.*l2[km,kb] - l2[km,kc].transpose(0,2,1))
+                                lijabc_tmp += 2.* tmp
 
                                 km = kconserv[kj,kb,ki]
-                                if ka == kconserv[kshift,kc,km]:
-                                    tmp = einsum('ijmb,mac->ijabc',eris.ooov[ki,kj,km],l2[km,ka])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                #if kc == kconserv[kshift,ka,km]:
+                                tmp = einsum('ijmb,mac->ijabc',eris_ooov_ijX[iterki,iterkj,km],2.*l2[km,ka] - l2[km,kc].transpose(0,2,1))
+                                lijabc_tmp += 2.* tmp
 
                                 #(b,a,c) -> (a,b,c)
                                 km = kconserv[ki,kb,kj]
-                                if ka == kconserv[kshift,kc,km]:
-                                    tmp = einsum('jimb,mac->ijabc',eris.ooov[kj,ki,km],l2[km,ka])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if ka == kconserv[kshift,kc,km]:
+                                tmp = einsum('jimb,mac->ijabc',eris_ooov_jiX[iterkj,iterki,km],2.*l2[km,ka] - l2[km,kc].transpose(0,2,1))
+                                lijabc_tmp += -1.* tmp
 
                                 km = kconserv[kj,ka,ki]
-                                if kb == kconserv[kshift,kc,km]:
-                                    tmp = einsum('ijma,mbc->ijabc',eris.ooov[ki,kj,km],l2[km,kb])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if kb == kconserv[kshift,kc,km]:
+                                tmp = einsum('ijma,mbc->ijabc',eris_ooov_ijX[iterki,iterkj,km],2.*l2[km,kb] - l2[km,kc].transpose(0,2,1))
+                                lijabc_tmp += -1.* tmp
 
                                 #(c,b,a) -> (a,b,c)
                                 km = kconserv[ki,kc,kj]
-                                if kb == kconserv[kshift,ka,km]:
-                                    tmp = einsum('jimc,mba->ijabc',eris.ooov[kj,ki,km],l2[km,kb])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if kb == kconserv[kshift,ka,km]:
+                                tmp = einsum('jimc,mba->ijabc',eris_ooov_jiX[iterkj,iterki,km],2.*l2[km,kb] - l2[km,ka].transpose(0,2,1))
+                                lijabc_tmp += -1.* tmp
 
-                                km = kconserv[kj,kb,ki]
-                                if kc == kconserv[kshift,ka,km]:
-                                    tmp = einsum('ijmb,mca->ijabc',eris.ooov[ki,kj,km],l2[km,kc])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #km = kconserv[kj,kb,ki]
+                                ##if kc == kconserv[kshift,ka,km]:
+                                #tmp = einsum('ijmb,mca->ijabc',eris_ooov_ijX[iterki,iterkj,km],l2[km,kc])
+                                #lijabc_tmp += -2.* tmp
 
-                                #(a,c,b) -> (a,b,c)
-                                km = kconserv[ki,ka,kj]
-                                if kc == kconserv[kshift,kb,km]:
-                                    tmp = einsum('jima,mcb->ijabc',eris.ooov[kj,ki,km],l2[km,kc])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
-
-                                km = kconserv[kj,kc,ki]
-                                if ka == kconserv[kshift,kb,km]:
-                                    tmp = einsum('ijmc,mab->ijabc',eris.ooov[ki,kj,km],l2[km,ka])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
-
-                                #(b,c,a) -> (a,b,c)
-                                km = kconserv[ki,kc,kj]
-                                if ka == kconserv[kshift,kb,km]:
-                                    tmp = einsum('jimc,mab->ijabc',eris.ooov[kj,ki,km],l2[km,ka])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
-
-                                km = kconserv[kj,ka,ki]
-                                if kc == kconserv[kshift,kb,km]:
-                                    tmp = einsum('ijma,mcb->ijabc',eris.ooov[ki,kj,km],l2[km,kc])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
-
-                                #(c,a,b) -> (a,b,c)
-                                km = kconserv[ki,kb,kj]
-                                if kc == kconserv[kshift,ka,km]:
-                                    tmp = einsum('jimb,mca->ijabc',eris.ooov[kj,ki,km],l2[km,kc])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                ##(a,c,b) -> (a,b,c)
+                                #km = kconserv[ki,ka,kj]
+                                ##if kc == kconserv[kshift,kb,km]:
+                                #tmp = einsum('jima,mcb->ijabc',eris_ooov_jiX[iterkj,iterki,km],l2[km,kc])
+                                #lijabc_tmp += -2.* tmp
 
                                 km = kconserv[kj,kc,ki]
-                                if kb == kconserv[kshift,ka,km]:
-                                    tmp = einsum('ijmc,mba->ijabc',eris.ooov[ki,kj,km],l2[km,kb])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if ka == kconserv[kshift,kb,km]:
+                                tmp = einsum('ijmc,mab->ijabc',eris_ooov_ijX[iterki,iterkj,km],2.*l2[km,ka] - l2[km,kb].transpose(0,2,1))
+                                lijabc_tmp += -1.* tmp
 
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                ##(b,c,a) -> (a,b,c)
+                                #km = kconserv[ki,kc,kj]
+                                ##if ka == kconserv[kshift,kb,km]:
+                                #tmp = einsum('jimc,mab->ijabc',eris_ooov_jiX[iterkj,iterki,km],l2[km,ka])
+                                #lijabc_tmp += 1.* tmp
 
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #km = kconserv[kj,ka,ki]
+                                ##if kc == kconserv[kshift,kb,km]:
+                                #tmp = einsum('ijma,mcb->ijabc',eris_ooov_ijX[iterki,iterkj,km],l2[km,kc])
+                                #lijabc_tmp += 1.* tmp
 
-                                #(a,b,c) -> (a,b,c)
-                                ke = kconserv[kshift,kc,kj]
-                                if kb == kconserv[ki,ka,ke]:
-                                    tmp = -einsum('ieab,jec->ijabc',eris.ovvv[ki,ke,ka],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                ##(c,a,b) -> (a,b,c)
+                                #km = kconserv[ki,kb,kj]
+                                ##if kc == kconserv[kshift,ka,km]:
+                                #tmp = einsum('jimb,mca->ijabc',eris_ooov_jiX[iterkj,iterki,km],l2[km,kc])
+                                #lijabc_tmp += 1.* tmp
 
-                                ke = kconserv[kshift,kc,ki]
-                                if ka == kconserv[kj,kb,ke]:
-                                    tmp = -einsum('jeba,iec->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                #km = kconserv[kj,kc,ki]
+                                ##if kb == kconserv[kshift,ka,km]:
+                                #tmp = einsum('ijmc,mba->ijabc',eris_ooov_ijX[iterki,iterkj,km],l2[km,kb])
+                                #lijabc_tmp += 1.* tmp
 
-                                #(b,a,c) -> (a,b,c)
-                                ke = kconserv[kshift,kc,kj]
-                                if ka == kconserv[ki,kb,ke]:
-                                    tmp = -einsum('ieba,jec->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                # ovvv term 1
 
-                                ke = kconserv[kshift,kc,ki]
-                                if kb == kconserv[kj,ka,ke]:
-                                    tmp = -einsum('jeab,iec->ijabc',eris.ovvv[kj,ke,ka],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                # ke = ks - kc + kj
+                                # kb = ki + ke - ka
+                                #    = ki + ks - kc + kj - ka
+                                #    = ki + kj + ks - ka - kc
 
-                                #(c,b,a) -> (a,b,c)
-                                ke = kconserv[kshift,ka,kj]
-                                if kb == kconserv[ki,kc,ke]:
-                                    tmp = -einsum('iecb,jea->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                ##(a,b,c) -> (a,b,c)
+                                #ke = kconserv[kshift,kc,kj]
+                                ##if kb == kconserv[ki,ka,ke]:
+                                #tmp = -einsum('ieab,jec->ijabc',eris.ovvv[ki,ke,ka],l2[kj,ke])
+                                #lijabc_tmp += 4.* tmp
+
+                                #ke = kconserv[kshift,kc,ki]
+                                ##if ka == kconserv[kj,kb,ke]:
+                                #tmp = -einsum('jeba,iec->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ke])
+                                #lijabc_tmp += 4.* tmp
+
+                                ##(b,a,c) -> (a,b,c)
+                                #ke = kconserv[kshift,kc,kj]
+                                ##if ka == kconserv[ki,kb,ke]:
+                                #tmp = -einsum('ieba,jec->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ke])
+                                #lijabc_tmp += -2.* tmp
+
+                                #ke = kconserv[kshift,kc,ki]
+                                ##if kb == kconserv[kj,ka,ke]:
+                                #tmp = -einsum('jeab,iec->ijabc',eris.ovvv[kj,ke,ka],l2[ki,ke])
+                                #lijabc_tmp += -2.* tmp
+
+                                ##(c,b,a) -> (a,b,c)
+                                #ke = kconserv[kshift,ka,kj]
+                                ##if kb == kconserv[ki,kc,ke]:
+                                #tmp = -einsum('iecb,jea->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ke])
+                                #lijabc_tmp += -2.* tmp
 
                                 ke = kconserv[kshift,ka,ki]
-                                if kc == kconserv[kj,kb,ke]:
-                                    tmp = -einsum('jebc,iea->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if kc == kconserv[kj,kb,ke]:
+                                tmp = -einsum('jebc,iea->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ke]-2.*l2[ki,ka].transpose(0,2,1))
+                                lijabc_tmp += -2.* tmp
 
                                 #(a,c,b) -> (a,b,c)
                                 ke = kconserv[kshift,kb,kj]
-                                if kc == kconserv[ki,ka,ke]:
-                                    tmp = -einsum('ieac,jeb->ijabc',eris.ovvv[ki,ke,ka],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if kc == kconserv[ki,ka,ke]:
+                                tmp = -einsum('ieac,jeb->ijabc',eris.ovvv[ki,ke,ka],l2[kj,ke]-2.*l2[kj,kb].transpose(0,2,1))
+                                lijabc_tmp += -2.* tmp
 
-                                ke = kconserv[kshift,kb,ki]
-                                if ka == kconserv[kj,kc,ke]:
-                                    tmp = -einsum('jeca,ieb->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #ke = kconserv[kshift,kb,ki]
+                                ##if ka == kconserv[kj,kc,ke]:
+                                #tmp = -einsum('jeca,ieb->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ke])
+                                #lijabc_tmp += -2.* tmp
 
                                 #(b,c,a) -> (a,b,c)
                                 ke = kconserv[kshift,kb,kj]
-                                if ka == kconserv[ki,kc,ke]:
-                                    tmp = -einsum('ieca,jeb->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if ka == kconserv[ki,kc,ke]:
+                                tmp = -einsum('ieca,jeb->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ke]-2.*l2[kj,kb].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 ke = kconserv[kshift,kb,ki]
-                                if kc == kconserv[kj,ka,ke]:
-                                    tmp = -einsum('jeac,ieb->ijabc',eris.ovvv[kj,ke,ka],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kc == kconserv[kj,ka,ke]:
+                                tmp = -einsum('jeac,ieb->ijabc',eris.ovvv[kj,ke,ka],l2[ki,ke]-2.*l2[ki,kb].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 #(c,a,b) -> (a,b,c)
                                 ke = kconserv[kshift,ka,kj]
-                                if kc == kconserv[ki,kb,ke]:
-                                    tmp = -einsum('iebc,jea->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ke])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kc == kconserv[ki,kb,ke]:
+                                tmp = -einsum('iebc,jea->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ke]-2.*l2[kj,ka].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 ke = kconserv[kshift,ka,ki]
-                                if kb == kconserv[kj,kc,ke]:
-                                    tmp = -einsum('jecb,iea->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ke])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kb == kconserv[kj,kc,ke]:
+                                tmp = -einsum('jecb,iea->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ke]-2.*l2[ki,ka].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                # ovvv term 2
 
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                # ke = kshift + ki - ka
+                                # kb = kj + ke - kc
+                                #    = kj + ki + kshift - ka - kc
 
-                                #(a,b,c) -> (a,b,c)
-                                ke = kconserv[kshift,ka,ki]
-                                if kb == kconserv[kj,kc,ke]:
-                                    tmp = -einsum('jebc,iae->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ka])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                ##(a,b,c) -> (a,b,c)
+                                #ke = kconserv[kshift,ka,ki]
+                                ##if kb == kconserv[kj,kc,ke]:
+                                #tmp = -einsum('jebc,iae->ijabc',eris.ovvv[kj,ke,kb],l2[ki,ka])
+                                #lijabc_tmp += 4.* tmp
 
-                                ke = kconserv[kshift,kb,kj]
-                                if ka == kconserv[ki,kc,ke]:
-                                    tmp = -einsum('ieac,jbe->ijabc',eris.ovvv[ki,ke,ka],l2[kj,kb])
-                                    lijabc[ki,kj,ka,kb] += 4.* tmp
+                                #ke = kconserv[kshift,kb,kj]
+                                ##if ka == kconserv[ki,kc,ke]:
+                                #tmp = -einsum('ieac,jbe->ijabc',eris.ovvv[ki,ke,ka],l2[kj,kb])
+                                #lijabc_tmp += 4.* tmp
 
-                                #(b,a,c) -> (a,b,c)
-                                ke = kconserv[kshift,kb,ki]
-                                if ka == kconserv[kj,kc,ke]:
-                                    tmp = -einsum('jeac,ibe->ijabc',eris.ovvv[kj,ke,ka],l2[ki,kb])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                ##(b,a,c) -> (a,b,c)
+                                #ke = kconserv[kshift,kb,ki]
+                                ##if ka == kconserv[kj,kc,ke]:
+                                #tmp = -einsum('jeac,ibe->ijabc',eris.ovvv[kj,ke,ka],l2[ki,kb])
+                                #lijabc_tmp += -2.* tmp
 
-                                ke = kconserv[kshift,ka,kj]
-                                if kb == kconserv[ki,kc,ke]:
-                                    tmp = -einsum('iebc,jae->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ka])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #ke = kconserv[kshift,ka,kj]
+                                ##if kb == kconserv[ki,kc,ke]:
+                                #tmp = -einsum('iebc,jae->ijabc',eris.ovvv[ki,ke,kb],l2[kj,ka])
+                                #lijabc_tmp += -2.* tmp
 
                                 #(c,b,a) -> (a,b,c)
                                 ke = kconserv[kshift,kc,ki]
-                                if kb == kconserv[kj,ka,ke]:
-                                    tmp = -einsum('jeba,ice->ijabc',eris.ovvv[kj,ke,kb],l2[ki,kc])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if kb == kconserv[kj,ka,ke]:
+                                tmp = -einsum('jeba,ice->ijabc',eris.ovvv[kj,ke,kb],l2[ki,kc]-2.*l2[ki,ke].transpose(0,2,1))
+                                lijabc_tmp += -2.* tmp
 
-                                ke = kconserv[kshift,kb,kj]
-                                if kc == kconserv[ki,ka,ke]:
-                                    tmp = -einsum('ieca,jbe->ijabc',eris.ovvv[ki,ke,kc],l2[kj,kb])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #ke = kconserv[kshift,kb,kj]
+                                ##if kc == kconserv[ki,ka,ke]:
+                                #tmp = -einsum('ieca,jbe->ijabc',eris.ovvv[ki,ke,kc],l2[kj,kb])
+                                #lijabc_tmp += -2.* tmp
 
-                                #(a,c,b) -> (a,b,c)
-                                ke = kconserv[kshift,ka,ki]
-                                if kc == kconserv[kj,kb,ke]:
-                                    tmp = -einsum('jecb,iae->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ka])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                ##(a,c,b) -> (a,b,c)
+                                #ke = kconserv[kshift,ka,ki]
+                                ##if kc == kconserv[kj,kb,ke]:
+                                #tmp = -einsum('jecb,iae->ijabc',eris.ovvv[kj,ke,kc],l2[ki,ka])
+                                #lijabc_tmp += -2.* tmp
 
                                 ke = kconserv[kshift,kc,kj]
-                                if ka == kconserv[ki,kb,ke]:
-                                    tmp = -einsum('ieab,jce->ijabc',eris.ovvv[ki,ke,ka],l2[kj,kc])
-                                    lijabc[ki,kj,ka,kb] += -2.* tmp
+                                #if ka == kconserv[ki,kb,ke]:
+                                tmp = -einsum('ieab,jce->ijabc',eris.ovvv[ki,ke,ka],l2[kj,kc]-2.*l2[kj,ke].transpose(0,2,1))
+                                lijabc_tmp += -2.* tmp
 
                                 #(b,c,a) -> (a,b,c)
                                 ke = kconserv[kshift,kc,ki]
-                                if ka == kconserv[kj,kb,ke]:
-                                    tmp = -einsum('jeab,ice->ijabc',eris.ovvv[kj,ke,ka],l2[ki,kc])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if ka == kconserv[kj,kb,ke]:
+                                tmp = -einsum('jeab,ice->ijabc',eris.ovvv[kj,ke,ka],l2[ki,kc]-2.*l2[ki,ke].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 ke = kconserv[kshift,ka,kj]
-                                if kc == kconserv[ki,kb,ke]:
-                                    tmp = -einsum('iecb,jae->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ka])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kc == kconserv[ki,kb,ke]:
+                                tmp = -einsum('iecb,jae->ijabc',eris.ovvv[ki,ke,kc],l2[kj,ka]-2.*l2[kj,ke].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 #(c,a,b) -> (a,b,c)
                                 ke = kconserv[kshift,kb,ki]
-                                if kc == kconserv[kj,ka,ke]:
-                                    tmp = -einsum('jeca,ibe->ijabc',eris.ovvv[kj,ke,kc],l2[ki,kb])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kc == kconserv[kj,ka,ke]:
+                                tmp = -einsum('jeca,ibe->ijabc',eris.ovvv[kj,ke,kc],l2[ki,kb]-2.*l2[ki,ke].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
                                 ke = kconserv[kshift,kc,kj]
-                                if kb == kconserv[ki,ka,ke]:
-                                    tmp = -einsum('ieba,jce->ijabc',eris.ovvv[ki,ke,kb],l2[kj,kc])
-                                    lijabc[ki,kj,ka,kb] += 1.* tmp
+                                #if kb == kconserv[ki,ka,ke]:
+                                tmp = -einsum('ieba,jce->ijabc',eris.ovvv[ki,ke,kb],l2[kj,kc]-2.*l2[kj,ke].transpose(0,2,1))
+                                lijabc_tmp += 1.* tmp
 
 
-                            ##########################################
-                            #                                        #
-                            # Starting the right amplitude equations #
-                            #                                        #
-                            ##########################################
+                                ##########################################
+                                #                                        #
+                                # Starting the right amplitude equations #
+                                #                                        #
+                                ##########################################
 
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
-
+                                # kf = ks
+                                # ke = ki + kj - ka
+                                # kc = kf + ke - kb
+                                #    = ks + ki + kj - ka - kb
                                 kf = kshift
                                 ke = kconserv[ki,ka,kj]
-                                if kc == kconserv[kf,kb,ke]:
-                                    tmp = - numpy.einsum('bcef,ijae,f->ijabc',eris.vvvv[kb,kc,ke],
-                                            unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kc == kconserv[kf,kb,ke]:
+                                tmp = - einsum('bcef,ijae,f->ijabc',eris.vvvv[kb,kc,ke],
+                                        unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
+                                rijabc_tmp += tmp
 
                                 kf = kshift
                                 ke = kconserv[kj,kb,ki]
-                                if kc == kconserv[kf,ka,ke]:
-                                    tmp = - numpy.einsum('acef,jibe,f->ijabc',eris.vvvv[ka,kc,ke],
-                                            unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #if kc == kconserv[kf,ka,ke]:
+                                tmp = - einsum('acef,jibe,f->ijabc',eris.vvvv[ka,kc,ke],
+                                        unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
+                                rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[ke,kc,kj]
-                                if kb == kconserv[ki,ka,km]:
-                                    tmp = einsum('mcje,imab,e->ijabc',eris.ovov[km,kc,kj],
-                                            unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kb == kconserv[ki,ka,km]:
+                                tmp = einsum('mcje,imab,e->ijabc',eris.ovov[km,kc,kj],
+                                        unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[ke,kc,ki]
-                                if ka == kconserv[kj,kb,km]:
-                                    tmp = einsum('mcie,jmba,e->ijabc',eris.ovov[km,kc,ki],
-                                            unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #if ka == kconserv[kj,kb,km]:
+                                tmp = einsum('mcie,jmba,e->ijabc',eris.ovov[km,kc,ki],
+                                        unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[kc,ki,ka]
-                                if kb == kconserv[kj,km,ke]:
-                                    tmp = einsum('mbej,imac,e->ijabc',eris.ovvo[km,kb,ke],
-                                            unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kb == kconserv[kj,km,ke]:
+                                tmp = einsum('mbej,imac,e->ijabc',eris.ovvo[km,kb,ke],
+                                        unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[kc,kj,kb]
-                                if ka == kconserv[ki,km,ke]:
-                                    tmp = einsum('maei,jmbc,e->ijabc',eris.ovvo[km,ka,ke],
-                                            unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
-                                    rijabc[ki,kj,ka,kb] += tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #if ka == kconserv[ki,km,ke]:
+                                tmp = einsum('maei,jmbc,e->ijabc',eris.ovvo[km,ka,ke],
+                                        unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 km = kconserv[ki,ka,kj]
-                                if kb == kconserv[ks,kc,km]:
-                                    tmp = einsum('maji,mbc->ijabc',eris.ovoo[km,ka,kj],r2[km,kb])
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kb == kconserv[ks,kc,km]:
+                                tmp = einsum('maji,mbc->ijabc',eris.ovoo[km,ka,kj],r2[km,kb])
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 km = kconserv[kj,kb,ki]
-                                if ka == kconserv[ks,kc,km]:
-                                    tmp = einsum('mbij,mac->ijabc',eris.ovoo[km,kb,ki],r2[km,ka])
-                                    rijabc[ki,kj,ka,kb] += tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #if ka == kconserv[ks,kc,km]:
+                                tmp = einsum('mbij,mac->ijabc',eris.ovoo[km,kb,ki],r2[km,ka])
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 ke = kconserv[ks,ka,ki]
-                                if kb == kconserv[ke,kc,kj]:
-                                    tmp = -einsum('ejcb,iae->ijabc',eris.vovv[ke,kj,kc].conj(),r2[ki,ka])
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kb == kconserv[ke,kc,kj]:
+                                tmp = -einsum('ejcb,iae->ijabc',eris.vovv[ke,kj,kc].conj(),r2[ki,ka])
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 ke = kconserv[ks,kb,kj]
-                                if ka == kconserv[ke,kc,ki]:
-                                    tmp = -einsum('eica,jbe->ijabc',eris.vovv[ke,ki,kc].conj(),r2[kj,kb])
-                                    rijabc[ki,kj,ka,kb] += tmp
-
-                            for iterkb, kb in enumerate(range(nkpts)):
-
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                #if ka == kconserv[ke,kc,ki]:
+                                tmp = -einsum('eica,jbe->ijabc',eris.vovv[ke,ki,kc].conj(),r2[kj,kb])
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 ke = kconserv[ks,kc,kj]
-                                if kb == kconserv[ki,ka,ke]:
-                                    tmp = -einsum('eiba,jec->ijabc',eris.vovv[ke,ki,kb].conj(),r2[kj,ke])
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if kb == kconserv[ki,ka,ke]:
+                                tmp = -einsum('eiba,jec->ijabc',eris.vovv[ke,ki,kb].conj(),r2[kj,ke])
+                                rijabc_tmp += tmp
 
                                 ks = kshift
                                 ke = kconserv[ks,kc,ki]
-                                if ka == kconserv[kj,kb,ke]:
-                                    tmp = -einsum('ejab,iec->ijabc',eris.vovv[ke,kj,ka].conj(),r2[ki,ke])
-                                    rijabc[ki,kj,ka,kb] += tmp
+                                #if ka == kconserv[kj,kb,ke]:
+                                tmp = -einsum('ejab,iec->ijabc',eris.vovv[ke,kj,ka].conj(),r2[ki,ke])
+                                rijabc_tmp += tmp
 
-                            eia = numpy.diagonal(foo[ki]).reshape(-1,1) - numpy.diagonal(fvv[ka])
-                            eia += _eval
-                            for iterkb, kb in enumerate(range(nkpts)):
+                                eia = numpy.diagonal(foo[ki]).reshape(-1,1) - numpy.diagonal(fvv[ka])
+                                eia += _eval
                                 ejb = numpy.diagonal(foo[kj]).reshape(-1,1) - numpy.diagonal(fvv[kb])
                                 eijab = pyscf.lib.direct_sum('ia,jb->ijab',eia,ejb)
 
-                                kc = tools.get_kconserv3(self._scf.cell, self._kpts, [ki,kj,kshift,ka,kb])
+                                kc = kclist[iterki,iterkj,ka,kb]
                                 eijabc = pyscf.lib.direct_sum('ijab,c->ijabc',eijab,-numpy.diagonal(fvv[kc]))
                                 eijabc = 1./eijabc
 
-                                pt2_energy += 0.5*einsum('ijabc,ijabc,ijabc',lijabc[ki,kj,ka,kb].conj(),rijabc[ki,kj,ka,kb],eijabc)
-                                #for iterkc, kc in enumerate(range(nkpts)):
-                                #    eijabc = pyscf.lib.direct_sum('ijab,c->ijabc',eijab,-numpy.diagonal(fvv[kc]))
-                                #    eijabc = 1./eijabc
-                                #
-                                #    pt2_energy += 0.5*einsum('ijabc,ijabc,ijabc',lijabc[ki,kj,ka,kb,kc].conj(),rijabc[ki,kj,ka,kb,kc],eijabc)
+                                #pt2_energy += 0.5*einsum('ijabc,ijabc,ijabc',lijabc_tmp.conj(),rijabc_tmp,eijabc)
+                                pt2_energy += fac*0.5*einsum('ijabc,ijabc,ijabc',lijabc_tmp,rijabc_tmp,eijabc)
 
 
             self.comm.Allreduce(MPI.IN_PLACE, pt2_energy, op=MPI.SUM)
@@ -2825,7 +2826,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         def mem_usage_ovoo(nocc, nvir, nkpts):
             return nocc**3 * nvir**1 * 16
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_ovoo(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_ovoo(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2874,7 +2875,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         def mem_usage_ovvok(nocc, nvir, nkpts):
             return nocc**2 * nvir**2 * nkpts *  16
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, 2.*mem_usage_ovvok(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, 2.*mem_usage_ovvok(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 
@@ -2904,7 +2905,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
         def mem_usage_ovvok(nocc, nvir, nkpts):
             return nocc**2 * nvir**2 * nkpts *  16
         array_size = [nkpts,nkpts]
-        chunk_size = get_max_blocksize_from_mem(0.3e9, 3.*mem_usage_ovvok(nkpts,nocc,nvir),
+        chunk_size = get_max_blocksize_from_mem(0.3e9, 3.*mem_usage_ovvok(nocc,nvir,nkpts),
                                                 array_size, priority_list=[1,1])
         task_list = generate_task_list(chunk_size,array_size)
 

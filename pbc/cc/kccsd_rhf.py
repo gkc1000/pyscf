@@ -21,7 +21,7 @@ from pyscf.lib.numpy_helper import cartesian_prod
 from pyscf.pbc.lib.linalg_helper import eigs
 from pyscf.pbc.cc_test.kpoint_helper import tril_index
 from pyscf.pbc.cc_test.kpoint_helper import unpack_tril
-from mpi4pyscf_new import mpi
+from pyscf.pbc.qsun_mpitools import mpi
 #from pyscf.pbc.lib.davidson import eigs
 
 def barrier(comm, tag=0, sleep=0.01):

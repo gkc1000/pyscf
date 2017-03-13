@@ -1417,6 +1417,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
 
     @profile
     def ipccsd_pt2(self, ipccsd_evals, ipccsd_evecs, lipccsd_evecs):
+        nproc = self.comm.Get_size()
         nocc = self.nocc()
         nvir = self.nmo() - nocc
         nkpts = self.nkpts
@@ -1445,6 +1446,9 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             array_size = [nkpts,nkpts]
             chunk_size = get_max_blocksize_from_mem(0.3e9, mem_usage_oookk(nocc,nvir,nkpts),
                                                     array_size, priority_list=[1,1])
+            max_chunk_size = tuple(nkpts//numpy.array([nproc,nproc]))
+            if max_chunk_size[0] < chunk_size[0]:
+                chunk_size = max_chunk_size
             task_list = generate_task_list(chunk_size,array_size)
 
             pt2_energy = numpy.array(0.0 + 1j*0.0)
@@ -1746,24 +1750,32 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                                 km = kshift
                                 ke = kconserv[ki,ka,kj]
                                 #if kk == kconserv[kb,ke,km]:
-                                tmp2 = -einsum('mbke,ijae,m->ijkab',eris.ovov[km,kb,kk],unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
+                                tmp = einsum('mbke,m->bke',eris.ovov[km,kb,kk],r1)
+                                tril = unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj])
+                                tmp2 = -einsum('bke,ijae->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 ke = kconserv[ki,kb,kj]
                                 #if kk == kconserv[ka,ke,km]:
-                                tmp2 = -einsum('make,jibe,m->ijkab',eris.ovov[km,ka,kk],unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
+                                tmp = einsum('make,m->ake',eris.ovov[km,ka,kk],r1)
+                                tril = unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki])
+                                tmp2 = -einsum('ake,jibe->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 kk = kklist[ka,kb,iterki,iterkj]
                                 km = kshift
                                 ke = kconserv[km,kj,kb]
                                 #if kk == kconserv[ka,ki,ke]:
-                                tmp2 = -einsum('mbej,ikae,m->ijkab',eris.ovvo[km,kb,ke],unpack_tril(t2,nkpts,ki,kk,ka,kconserv[ki,ka,kk]),r1)
+                                tmp = einsum('mbej,m->bej',eris.ovvo[km,kb,ke],r1)
+                                tril = unpack_tril(t2,nkpts,ki,kk,ka,kconserv[ki,ka,kk])
+                                tmp2 = -einsum('bej,ikae->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 ke = kconserv[km,ki,ka]
                                 #if kk == kconserv[kb,kj,ke]:
-                                tmp2 = -einsum('maei,jkbe,m->ijkab',eris.ovvo[km,ka,ke],unpack_tril(t2,nkpts,kj,kk,kb,kconserv[kj,kb,kk]),r1)
+                                tmp = einsum('maei,m->aei',eris.ovvo[km,ka,ke],r1)
+                                tril = unpack_tril(t2,nkpts,kj,kk,kb,kconserv[kj,kb,kk])
+                                tmp2 = -einsum('aei,jkbe->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 kn = kshift
@@ -1773,12 +1785,16 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                                 kk = kklist[ka,kb,iterki,iterkj]
                                 km = kconserv[ka,ki,kb]
                                 #if kk == kconserv[km,kj,kn]:
-                                tmp2 = einsum('mnjk,imab,n->ijkab',eris.oooo[km,kshift,kj],unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                tmp = einsum('mnjk,n->mjk',eris.oooo[km,kshift,kj],r1)
+                                tril = unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km])
+                                tmp2 = einsum('mjk,imab->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 km = kconserv[kb,kj,ka]
                                 #if kk == kconserv[km,ki,kn]:
-                                tmp2 = einsum('mnik,jmba,n->ijkab',eris.oooo[km,kshift,ki],unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                tmp = einsum('mnik,n->mik',eris.oooo[km,kshift,ki],r1)
+                                tril = unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km])
+                                tmp2 = einsum('mnik,jmba,n->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 ke = kconserv[ka,ki,kb]
@@ -2096,13 +2112,13 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             Wvovv_slc = _cp(imds.Wvovv[kshift,slice(*klrange),slice(*kcrange)])
 
             for iterkl, kl in enumerate(range(*klrange)):
-                Hr2[kl,kshift] += einsum('c,ld->lcd',r1,imds.Fov[kl])
                 for iterkc, kc in enumerate(range(*kcrange)):
                     kd = kconserv[kl,kc,kshift]
                     Hr2[kl,kc] += einsum('lad,ac->lcd',r2[kl,kc],imds.Lvv[kc])
                     Hr2[kl,kc] += einsum('lcb,bd->lcd',r2[kl,kc],imds.Lvv[kd])
                     Hr2[kl,kc] += einsum('a,alcd->lcd',r1,Wvovv_slc[iterkl,iterkc])
                     Hr2[kl,kc] -= einsum('jcd,lj->lcd',r2[kl,kc],imds.Loo[kl])
+                    Hr2[kl,kshift] += (kl==kd)*einsum('c,ld->lcd',r1,imds.Fov[kl])
 
         def mem_usage_voovk(nocc, nvir, nkpts):
             return nocc**2 * nvir**2 * nkpts * 16.
@@ -2565,43 +2581,55 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                                 kf = kshift
                                 ke = kconserv[ki,ka,kj]
                                 #if kc == kconserv[kf,kb,ke]:
-                                tmp = - einsum('bcef,ijae,f->ijabc',eris.vvvv[kb,kc,ke],
-                                        unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj]),r1)
+                                vvvv = _cp(eris.vvvv[kb,kc,ke])
+                                tmp2 = einsum('bcef,f->bce',vvvv,r1)
+                                tril = unpack_tril(t2,nkpts,ki,kj,ka,kconserv[ki,ka,kj])
+                                tmp = - einsum('bce,ijae->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 kf = kshift
                                 ke = kconserv[kj,kb,ki]
                                 #if kc == kconserv[kf,ka,ke]:
-                                tmp = - einsum('acef,jibe,f->ijabc',eris.vvvv[ka,kc,ke],
-                                        unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki]),r1)
+                                vvvv = _cp(eris.vvvv[ka,kc,ke])
+                                tmp2 = einsum('acef,f->ace',vvvv,r1)
+                                tril = unpack_tril(t2,nkpts,kj,ki,kb,kconserv[kj,kb,ki])
+                                tmp = - einsum('ace,jibe->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[ke,kc,kj]
                                 #if kb == kconserv[ki,ka,km]:
-                                tmp = einsum('mcje,imab,e->ijabc',eris.ovov[km,kc,kj],
-                                        unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                ovov = _cp(eris.ovov[km,kc,kj])
+                                tmp2 = einsum('mcje,e->mcj',ovov,r1)
+                                tril = unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km])
+                                tmp = einsum('mcj,imab->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[ke,kc,ki]
                                 #if ka == kconserv[kj,kb,km]:
-                                tmp = einsum('mcie,jmba,e->ijabc',eris.ovov[km,kc,ki],
-                                        unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                ovov = _cp(eris.ovov[km,kc,ki])
+                                tmp2 = einsum('mcie,e->mci',ovov,r1)
+                                tril = unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km])
+                                tmp = einsum('mci,jmba->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[kc,ki,ka]
                                 #if kb == kconserv[kj,km,ke]:
-                                tmp = einsum('mbej,imac,e->ijabc',eris.ovvo[km,kb,ke],
-                                        unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km]),r1)
+                                ovvo = _cp(eris.ovvo[km,kb,ke])
+                                tmp2 = einsum('mbej,e->mbj',ovvo,r1)
+                                tril = unpack_tril(t2,nkpts,ki,km,ka,kconserv[ki,ka,km])
+                                tmp = einsum('mbj,imac->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 ke = kshift
                                 km = kconserv[kc,kj,kb]
                                 #if ka == kconserv[ki,km,ke]:
-                                tmp = einsum('maei,jmbc,e->ijabc',eris.ovvo[km,ka,ke],
-                                        unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km]),r1)
+                                ovvo = _cp(eris.ovvo[km,ka,ke])
+                                tmp2 = einsum('maei,e->mai',ovvo,r1)
+                                tril = unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km])
+                                tmp = einsum('mai,jmbc->ijabc',tmp2,tril)
                                 rijabc_tmp += tmp
 
                                 ks = kshift

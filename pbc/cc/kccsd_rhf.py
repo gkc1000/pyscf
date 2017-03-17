@@ -1794,7 +1794,7 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                                 #if kk == kconserv[km,ki,kn]:
                                 tmp = einsum('mnik,n->mik',eris.oooo[km,kshift,ki],r1)
                                 tril = unpack_tril(t2,nkpts,kj,km,kb,kconserv[kj,kb,km])
-                                tmp2 = einsum('mnik,jmba,n->ijkab',tmp,tril)
+                                tmp2 = einsum('mik,jmba->ijkab',tmp,tril)
                                 rijkab_tmp += tmp2
 
                                 ke = kconserv[ka,ki,kb]

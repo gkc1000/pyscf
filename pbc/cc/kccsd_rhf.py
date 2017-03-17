@@ -2886,12 +2886,6 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
             Wooov_lks = _cp(imds.Wooov[slice(*klrange),slice(*kkrange),kshift])
 
             for iterkk, kk in enumerate(range(*kkrange)):
-                Hr2[kk,kshift] -= einsum('kd,l->kld',imds.Fov[kk],r1)
-
-            for iterkl, kl in enumerate(range(*klrange)):
-                Hr2[kshift,kl] += 2.*einsum('ld,k->kld',imds.Fov[kl],r1)
-
-            for iterkk, kk in enumerate(range(*kkrange)):
                 for iterkl, kl in enumerate(range(*klrange)):
                     kd = kconserv[kk,kshift,kl]
                     Hr2[kk,kl] -= 2.*einsum('klid,i->kld',Wooov_kls[iterkk,iterkl],r1)
@@ -2899,6 +2893,8 @@ class RCCSD(pyscf.cc.ccsd.CCSD):
                     Hr2[kk,kl] -= einsum('ki,ild->kld',imds.Loo[kk],r2[kk,kl])
                     Hr2[kk,kl] -= einsum('lj,kjd->kld',imds.Loo[kl],r2[kk,kl])
                     Hr2[kk,kl] += einsum('bd,klb->kld',imds.Lvv[kd],r2[kk,kl])
+                    Hr2[kk,kshift] -= (kk==kd)*einsum('kd,l->kld',imds.Fov[kk],r1)
+                    Hr2[kshift,kl] += (kl==kd)*2.*einsum('ld,k->kld',imds.Fov[kl],r1)
 
         def mem_usage_ovvok(nocc, nvir, nkpts):
             return nocc**2 * nvir**2 * nkpts *  16

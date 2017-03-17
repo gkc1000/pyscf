@@ -146,9 +146,38 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, G0eq0=True):
                 qidx = old_qidx[ kGz_loc ]
                 coulG[ kGz_loc ] += mf.exx_vq[ exx_loc, qidx ]
 
-            #if G0eq0 is True:
-            #    if np.linalg.norm(k) < 1e-8:
-            #        coulG[0] = 0.0
+                #if exx is True:
+                #    if np.linalg.norm(k) < 1e-8 and abs(gz) < 1e-8:
+                #        coulG[0] = 0.0
+
+                if G0eq0 is True:
+                    if np.linalg.norm(k) < 1e-8 and abs(gz) < 1e-8:
+                        coulG[0] = 0.0
+
+            # The following is an implementation of Rozzi's cylindrical cut-off
+            #
+            # NOTE: This hasn't been implemented in the ewald treatment, so it isn't
+            #       too useful besides to check the above Wigner-Seitz method...
+
+            #Rin = min(cell._h[0,0],cell._h[1,1])/2.
+            #Gz = kG[:,2]
+            #Gp = np.array([np.linalg.norm(x) for x in kG[:,:2]])
+            #Gz_N0 = abs(Gz) > 0
+            #coulG = 0.0*absG2
+            #with np.errstate(divide='ignore',invalid='ignore'):
+            #    coulG[ Gz_N0 ] = 4*np.pi/absG2[ Gz_N0 ] * ( 1. + Gp[ Gz_N0 ]*Rin*scipy.special.jn(1,Gp[ Gz_N0 ]*Rin)*scipy.special.kn(0,abs(Gz[ Gz_N0 ])*Rin)
+            #                                              - abs(Gz[ Gz_N0 ])*Rin*scipy.special.jn(0,Gp[ Gz_N0 ]*Rin)*scipy.special.kn(1,abs(Gz[ Gz_N0 ])*Rin))
+            #for i in np.where(Gz_N0==False)[0]:
+            #    if abs(Gz[i]) + Gp[i] > 1e-8:
+            #        def func(x):
+            #            return x*scipy.special.jn(0,Gp[i]*x)*np.log(x)
+            #        coulG[ i ] = - 4.*np.pi*scipy.integrate.quad(func,1e-6,Rin)[0]
+
+            #if np.linalg.norm(k) < 1e-8:
+            #    #if G0eq0 is True:
+            #    #    coulG[0] = 0.0
+            #    #else:
+            #    coulG[0] = -np.pi * Rin**2 * ( 2.*np.log(Rin) - 1 )
         elif cell.dimension == 2:
             L = cell._h[2,2]
             Gz = kG[:,2]
@@ -169,10 +198,40 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, G0eq0=True):
         if np.linalg.norm(k) < 1e-8:
             coulG[0] = 4*np.pi*0.5*Rc**2
     elif mf.exxdiv == 'ewald':
-        with np.errstate(divide='ignore'):
-            coulG = 4*np.pi/absG2
-        if np.linalg.norm(k) < 1e-8:
-            coulG[0] = Nk*cell.vol*madelung(cell, kpts)
+        if cell.dimension == 1:
+            if mf.exx_built == False:
+                mf.precompute_exx1D()
+            with np.errstate(divide='ignore',invalid='ignore'):
+                coulG = 4*np.pi/absG2*(1.0 - np.exp(-absG2/(4*mf.exx_alpha**2))) + 0j
+            if np.linalg.norm(k) < 1e-8:
+                coulG[0] = np.pi / mf.exx_alpha**2
+
+            # Index k+cell.Gv into the precomputed vq and add on
+            gxyz = np.round(np.dot(kG, mf.exx_kcell.h)/(2*np.pi)).astype(int)
+            ngs  = 2*mf.exx_kcell.gs+1
+            gxyz = (gxyz + ngs)%(ngs)
+            old_qidx = (gxyz[:,0]*ngs[1] + gxyz[:,1])*ngs[2] + gxyz[:,2]
+            for igz,gz in enumerate(np.unique(kG[:,2].round(decimals=14))):
+                # for a given gz, finds all kG with kGz = gz
+                kGz_loc = [ abs(kG[:,2] - gz)<1e-10 ]
+                # finds the index in our convolution list of the given gz
+                exx_loc = np.where( abs(mf.exx_gz - abs(gz))<1e-10 )[0][0]
+                qidx = old_qidx[ kGz_loc ]
+                coulG[ kGz_loc ] += mf.exx_vq[ exx_loc, qidx ]
+
+                if np.linalg.norm(k) < 1e-8 and abs(gz) < 1e-8:
+                    print coulG[0], madelung(cell,kpts, alpha = mf.exx_alpha), cell.vol, Nk
+                    coulG[0] += Nk*cell.vol*madelung(cell, kpts, alpha = mf.exx_alpha)
+        elif cell.dimension == 2:
+            raise NotImplementedError
+        else:
+            with np.errstate(divide='ignore'):
+                coulG = 4*np.pi/absG2
+            if np.linalg.norm(k) < 1e-8:
+                #print "madelung ", madelung(cell, kpts)
+                #print "madelung ", madelung(cell, kpts)*Nk
+                #print "madelung ", madelung(cell, kpts)*Nk*cell.vol
+                coulG[0] = Nk*cell.vol*madelung(cell, kpts)
     elif mf.exxdiv == 'vcut_ws':
         if mf.exx_built == False:
             mf.precompute_exx()
@@ -196,7 +255,7 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, G0eq0=True):
     return coulG
 
 
-def madelung(cell, kpts):
+def madelung(cell, kpts, alpha=None):
     from pyscf.pbc import gto as pbcgto
     from pyscf.pbc.scf.hf import ewald
 
@@ -209,7 +268,9 @@ def madelung(cell, kpts):
     ecell.unit = 'B'
     ecell.h = cell._h * Nk
     ecell.build(False,False)
-    return -2*ewald(ecell, ecell.ew_eta, ecell.ew_cut)
+    if alpha is None:
+        alpha = ecell.ew_eta
+    return -2*ewald(ecell, alpha, ecell.ew_cut)
 
 def get_monkhorst_pack_size(cell, kpts):
     skpts = cell.get_scaled_kpts(kpts).round(decimals=6)
@@ -263,6 +324,69 @@ def super_cell(cell, ncopy):
     return supcell
 
 kconserver = None
+
+@profile
+def get_kconserv3(cell, kpts, kijkab):
+    '''Get the momentum conservation array for a set of k-points.
+
+    Given k-point indices (k, l, m) the array kconserv[k,l,m] returns
+    the index n that satifies momentum conservation,
+
+       k(k) - k(l) = - k(m) + k(n)
+
+    This is used for symmetry e.g. integrals of the form
+        [\phi*[k](1) \phi[l](1) | \phi*[m](2) \phi[n](2)]
+    are zero unless n satisfies the above.
+    '''
+    nkpts = kpts.shape[0]
+    KLMN = np.zeros([nkpts,nkpts,nkpts], np.int)
+    kvecs = 2*np.pi*scipy.linalg.inv(cell._h)
+    kijkab = np.array(kijkab)
+
+    idx_sum = np.array([not(isinstance(x,int) or isinstance(x,np.int)) for x in kijkab])
+    idx_range = kijkab[idx_sum]
+    min_idx_range = np.zeros(5,dtype=int)
+    min_idx_range = np.array([min(x) for x in idx_range])
+    out_array_shape = tuple([len(x) for x in idx_range])
+    out_array = np.zeros(shape=out_array_shape,dtype=int)
+    #kijkab = kijkab[0:3].sum(axis=0) - kijkab[3:5].sum(axis=0)
+
+    #print kijkab
+
+    #for k in lib.cartesian_prod(klist):
+    kpqrst_idx = np.zeros(5,dtype=int)
+
+    # Order here matters! Speedup of around 50x when going from
+    # [-2,-1,...,2] to [0,-1,1,-2,2]
+    temp = [0,-1,1,-2,2]
+    xyz = lib.cartesian_prod((temp,temp,temp))
+    kshift = np.dot(xyz,kvecs)
+
+    for L, kvL in enumerate(lib.cartesian_prod(idx_range)):
+        kpqrst_idx[idx_sum], kpqrst_idx[~idx_sum] = kvL, kijkab[~idx_sum]
+        idx = tuple(kpqrst_idx[idx_sum]-min_idx_range)
+
+        kvec = kpts[kpqrst_idx]
+        kvec = kvec[0:3].sum(axis=0) - kvec[3:5].sum(axis=0)
+
+        found = 0
+        kvNs = kvec + kshift
+        for ishift in xrange(len(xyz)):
+            #kvN = kvec + np.dot(xyz[ishift],kvecs)
+            #kvN = kvec + kshift[ishift]
+            kvN = kvNs[ishift]
+            finder = np.where(np.logical_and(kpts < kvN + 1.e-12, kpts > kvN - 1.e-12).sum(axis=1)==3)
+            # The k-point should be the same in all 3 indices as kvN
+            if len(finder[0]) > 0:
+                found = 1
+                out_array[idx] = finder[0][0]
+                break
+
+        if found == 0:
+            print "** ERROR: Problem in get_kconserv. Quitting."
+            print kijkab
+            sys.exit()
+    return out_array
 
 def get_kconserv(cell, kpts):
     '''Get the momentum conservation array for a set of k-points.
